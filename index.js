@@ -1,9 +1,10 @@
 // Chat Auto Backup 插件 - 自动保存和恢复最近三次聊天记录
 // 主要功能：
-// 1. 自动保存最近聊天记录到IndexedDB (基于事件触发, 区分立即与防抖, 直接从内存获取数据)
+// 1. 自动保存最近聊天记录到IndexedDB (基于事件触发, 区分立即与防抖)
 // 2. 在插件页面显示保存的记录
 // 3. 提供恢复功能，将保存的聊天记录恢复到新的聊天中F
 // 4. 使用Web Worker优化深拷贝性能
+// 5. 对于高频事件强制保存，getcontext轮询确保数据一致性
 
 import {
     getContext,
@@ -34,7 +35,81 @@ import {
     select_group_chats,     // 用于选择群组聊天
 } from '../../../group-chats.js';
 
+// --- 备份类型枚举 ---
+const BACKUP_TYPE = {
+    STANDARD: 'standard', // 用于 AI 回复, 用户发送, 新swipe生成
+    SWIPE: 'swipe'        // 用于在已存在的swipes之间切换
+};
+
+// --- 备份状态控制 ---
+let isBackupInProgress = false; // 并发控制标志
+let backupTimeout = null;       // 防抖定时器 ID
+let currentBackupAttemptId = null; // 存储最新一次备份尝试的唯一ID
+
 // --- 新增：用于API交互的辅助函数 ---
+
+/**
+ * 获取指定角色聊天文件的完整内容 (元数据 + 消息数组)
+ * @param {string} characterName - 角色名称
+ * @param {string} chatFileName - 聊天文件名 (不带 .jsonl)
+ * @param {string} avatarFileName - 角色头像文件名
+ * @returns {Promise<Array|null>} 返回包含元数据和消息的数组，或在失败时返回null
+ */
+async function fetchCharacterChatContent(characterName, chatFileName, avatarFileName) {
+    logDebug(`[API] 正在获取角色 "${characterName}" 的聊天文件 "${chatFileName}.jsonl" 内容...`);
+    try {
+        const response = await fetch('/api/chats/get', {
+            method: 'POST',
+            headers: getRequestHeaders(),
+            body: JSON.stringify({
+                ch_name: characterName,
+                file_name: chatFileName,
+                avatar_url: avatarFileName,
+            }),
+        });
+        if (!response.ok) {
+            const errorText = await response.text();
+            throw new Error(`获取角色聊天内容API失败: ${response.status} - ${errorText}`);
+        }
+        const chatContentArray = await response.json(); // 应该返回 [metadata, ...messages]
+        logDebug(`[API] 成功获取角色 "${characterName}" 的聊天文件内容，总条目数: ${chatContentArray.length}`);
+        return chatContentArray;
+    } catch (error) {
+        console.error(`[API] fetchCharacterChatContent 错误:`, error);
+        return null;
+    }
+}
+
+/**
+ * 获取指定群组聊天文件的消息内容 (消息数组)
+ * 注意：此API通常只返回消息，元数据需从群组对象获取
+ * @param {string} groupId - 群组ID
+ * @param {string} groupChatId - 群组聊天ID (文件名，不带 .jsonl)
+ * @returns {Promise<Array|null>} 返回消息数组，或在失败时返回null
+ */
+async function fetchGroupChatMessages(groupId, groupChatId) {
+    logDebug(`[API] 正在获取群组 "${groupId}" 的聊天 "${groupChatId}.jsonl" 消息内容...`);
+    try {
+        const response = await fetch('/api/chats/group/get', {
+            method: 'POST',
+            headers: getRequestHeaders(),
+            body: JSON.stringify({
+                id: groupId, 
+                chat_id: groupChatId
+            }),
+        });
+        if (!response.ok) {
+            const errorText = await response.text();
+            throw new Error(`获取群组聊天消息API失败: ${response.status} - ${errorText}`);
+        }
+        const messagesArray = await response.json();
+        logDebug(`[API] 成功获取群组 "${groupId}" 的聊天 "${groupChatId}.jsonl" 消息，消息数: ${messagesArray.length}`);
+        return messagesArray;
+    } catch (error) {
+        console.error(`[API] fetchGroupChatMessages 错误:`, error);
+        return null;
+    }
+}
 
 /**
  * 将聊天元数据和消息数组构造成 .jsonl 格式的字符串
@@ -76,18 +151,21 @@ let workerRequestId = 0;
 // 数据库连接池 - 实现单例模式
 let dbConnection = null;
 
-// 备份状态控制
-let isBackupInProgress = false; // 并发控制标志
-let backupTimeout = null;       // 防抖定时器 ID
-
 // --- 深拷贝逻辑 (将在Worker和主线程中使用) ---
 const deepCopyLogicString = `
+    // Worker message handler - 优化版本，分离metadata和messages处理
     self.onmessage = function(e) {
         const { id, payload } = e.data;
+        if (!payload) {
+             self.postMessage({ id, error: 'Invalid payload received by worker' });
+             return;
+        }
         try {
-            // 直接返回，无需再组合
+            // payload中已经是通过postMessage的结构化克隆获得的API数据副本
+            // 无需额外深拷贝，直接返回
             self.postMessage({ id, result: payload });
         } catch (error) {
+            console.error('[Worker] Error during data processing for ID:', id, error);
             self.postMessage({ id, error: error.message || 'Worker processing failed' });
         }
     };
@@ -378,7 +456,7 @@ function getCurrentChatInfo() {
 
 // --- Web Worker 通信 ---
 // 发送数据到 Worker 并返回包含拷贝后数据的 Promise
-function performDeepCopyInWorker(metadataRef, messagesRef) {
+function performDeepCopyInWorker(payload) {
     return new Promise((resolve, reject) => {
         if (!backupWorker) {
             return reject(new Error("Backup worker not initialized."));
@@ -387,236 +465,386 @@ function performDeepCopyInWorker(metadataRef, messagesRef) {
         const currentRequestId = ++workerRequestId;
         workerPromises[currentRequestId] = { resolve, reject };
 
+        logDebug(`[主线程] 发送数据到 Worker (ID: ${currentRequestId}), Payload size: ${JSON.stringify(payload).length}`);
         try {
-            // 在主线程先组合
-            const combinedData = [metadataRef, ...messagesRef];
-            
-            // 然后只传一个组合好的对象
+            // 发送API获取的数据，利用postMessage的隐式克隆
             backupWorker.postMessage({
                 id: currentRequestId,
-                payload: combinedData
+                payload: payload
             });
         } catch (error) {
-            delete workerPromises[currentRequestId];
-            reject(error);
+             console.error(`[主线程] 发送消息到 Worker 失败 (ID: ${currentRequestId}):`, error);
+             delete workerPromises[currentRequestId];
+             reject(error);
         }
     });
 }
 
 // --- 核心备份逻辑封装 ---
-async function executeBackupLogic_Core(settings) {
-    const currentTimestamp = Date.now();
-    logDebug(`(封装) 开始执行核心备份逻辑 @ ${new Date(currentTimestamp).toLocaleTimeString()}`);
+async function executeBackupLogic_Core(settings, backupType = BACKUP_TYPE.STANDARD, attemptId, forceSave = false) {
+    logDebug(`[Backup #${attemptId.toString().slice(-6)}] executeBackupLogic_Core started. Type: ${backupType}, ForceSave: ${forceSave}`);
 
-    const contextSnapshot = getContext(); // 获取一次快照
-    const chatKey = getCurrentChatKey(); // chatKey 仍然需要 contextSnapshot 或 getContext()
-    if (!chatKey) {
-        console.warn('[聊天自动备份] (封装) 无有效的聊天标识符，无法执行备份');
+    if (isBackupInProgress) {
+        logDebug(`[Backup #${attemptId.toString().slice(-6)}] Core logic busy (isBackupInProgress=true). Aborting this attempt.`);
         return false;
     }
-
-    const { entityName, chatName } = getCurrentChatInfo(); // 这个也需要 contextSnapshot 或 getContext()
-    let originalChatMessagesCount = 0; // 将在这里或从 Worker 返回后确定
-
-    logDebug(`(封装) 准备备份聊天: ${entityName} - ${chatName}`);
-
-    // --- 步骤 1: 准备发送给 Worker 的数据【引用】 ---
-    let metadataRef;
-    let messagesRef;
+    isBackupInProgress = true;
+    logDebug(`[Backup #${attemptId.toString().slice(-6)}] Acquired isBackupInProgress lock.`);
 
     try {
-        if (contextSnapshot.groupId) {
-            const group = contextSnapshot.groups?.find(g => g.id === contextSnapshot.groupId);
-            const groupMeta = group ? (group.chatMatedata || group.chat_metadata) : null;
-            if (groupMeta && typeof groupMeta === 'object') {
-                metadataRef = groupMeta;
-            } else if (contextSnapshot.chatMetadata && typeof contextSnapshot.chatMetadata === 'object') {
-                metadataRef = contextSnapshot.chatMetadata;
-                 logDebug(`[getContext] 群组特定元数据未找到，使用 context.chatMetadata 作为备选`);
-            } else {
-                metadataRef = {};
-                logDebug(`[getContext] 群组特定元数据和备选均未找到，使用空元数据对象`);
+        const currentTimestamp = Date.now();
+        logDebug(`[Backup #${attemptId.toString().slice(-6)}] 开始执行核心备份逻辑 @ ${new Date(currentTimestamp).toLocaleTimeString()}`);
+
+        // 1. 获取当前上下文和关键信息
+        const chatKey = getCurrentChatKey();
+        if (!chatKey) {
+            console.warn(`[Backup #${attemptId.toString().slice(-6)}] 无有效的聊天标识符，无法执行备份`);
+            return false;
+        }
+
+        const { entityName, chatName } = getCurrentChatInfo();
+        let fullChatContentArray = null; 
+        let originalChatMessagesCount = 0;
+
+        logDebug(`[Backup #${attemptId.toString().slice(-6)}] 准备备份聊天: ${entityName} - ${chatName}`);
+
+        // 根据是否需要轮询来获取数据
+        if (forceSave) {
+            // 强制保存时进行轮询
+            const MAX_POLL_ATTEMPTS = 2;
+            const POLL_INTERVAL_MS = 350;
+            let pollAttempts = 0;
+            let serverChatContentArray = null;
+            let serverChatMessages = [];
+            let serverChatMetadata = {};
+            let isSynced = false;
+
+            if (currentBackupAttemptId !== attemptId) {
+                logDebug(`[Backup #${attemptId.toString().slice(-6)}] Cancelled at start of executeBackupLogic_Core's main logic.`);
+                return false;
             }
-        } else if (contextSnapshot.characterId !== undefined) {
-            metadataRef = contextSnapshot.chatMetadata || {};
+
+            while (pollAttempts < MAX_POLL_ATTEMPTS && !isSynced) {
+                if (currentBackupAttemptId !== attemptId) {
+                    logDebug(`[Backup #${attemptId.toString().slice(-6)}] Cancelled during polling loop (attempt #${pollAttempts + 1}).`);
+                    return false;
+                }
+                pollAttempts++;
+                logDebug(`[Backup #${attemptId.toString().slice(-6)}] Polling attempt #${pollAttempts}...`);
+
+                let clientContext;
+                try {
+                    clientContext = getContext();
+                    // --- 从后端API获取完整的聊天文件内容 ---
+                    const contextForAPI = clientContext;
+                    if (contextForAPI.groupId) {
+                        const group = contextForAPI.groups?.find(g => g.id === contextForAPI.groupId);
+                        const effectiveGroupChatId = group?.chat_id || contextForAPI.chatId;
+                        if (!effectiveGroupChatId) throw new Error(`Group chat ID not found for group ${contextForAPI.groupId}`);
+                        
+                        const messagesFromAPI = await fetchGroupChatMessages(group.id, effectiveGroupChatId);
+                        if (!messagesFromAPI) throw new Error("API for group messages returned null");
+                        
+                        // 2. 获取元数据 - 从当前加载的群组聊天中获取
+                        serverChatMetadata = structuredClone(contextForAPI.chatMetadata || {}); // 群组元数据更多依赖前端
+                        serverChatMessages = messagesFromAPI;
+                        serverChatContentArray = [serverChatMetadata, ...serverChatMessages];
+                    } else if (contextForAPI.characterId !== undefined) {
+                        const character = characters[contextForAPI.characterId];
+                        const effectiveCharChatFile = character?.chat || contextForAPI.chatId;
+                        if (!effectiveCharChatFile) throw new Error(`Character chat file not found for charId ${contextForAPI.characterId}`);
+                        
+                        const contentFromAPI = await fetchCharacterChatContent(character.name, effectiveCharChatFile, character.avatar);
+                        if (!contentFromAPI || contentFromAPI.length === 0) throw new Error("API for character chat returned null or empty");
+                        
+                        serverChatMetadata = contentFromAPI[0];
+                        serverChatMessages = contentFromAPI.slice(1);
+                        serverChatContentArray = contentFromAPI;
+                    } else {
+                        throw new Error("Cannot determine entity type for API call.");
+                    }
+                } catch (fetchOrContextError) {
+                    console.error(`[Backup #${attemptId.toString().slice(-6)}] Error polling (attempt #${pollAttempts}):`, fetchOrContextError);
+                    if (pollAttempts >= MAX_POLL_ATTEMPTS) break; // 超出次数则跳出循环
+                    if (currentBackupAttemptId !== attemptId) { 
+                        logDebug(`[Backup #${attemptId.toString().slice(-6)}] Cancelled while waiting after error.`); 
+                        return false; 
+                    }
+                    await new Promise(resolve => setTimeout(resolve, POLL_INTERVAL_MS));
+                    continue;
+                }
+
+                // --- 数据比对逻辑 ---
+                const clientChatMessages = clientContext.chat || [];
+                logDebug(`[Backup #${attemptId.toString().slice(-6)}] Comparing: Client msgs=${clientChatMessages.length}, API msgs=${serverChatMessages.length}`);
+                
+                if (backupType === BACKUP_TYPE.STANDARD) {
+                    if (clientChatMessages.length === serverChatMessages.length) {
+                        if (clientChatMessages.length > 0) {
+                            const clientLastMsg = clientChatMessages[clientChatMessages.length - 1];
+                            const serverLastMsg = serverChatMessages[serverChatMessages.length - 1];
+                            if (clientLastMsg.mes === serverLastMsg.mes && clientLastMsg.is_user === serverLastMsg.is_user) {
+                                if (!clientLastMsg.is_user) { // AI message, check swipe state
+                                    const clientSwipesLen = clientLastMsg.swipes ? clientLastMsg.swipes.length : 0;
+                                    const serverSwipesLen = serverLastMsg.swipes ? serverLastMsg.swipes.length : 0;
+                                    if (clientLastMsg.swipe_id === serverLastMsg.swipe_id && clientSwipesLen === serverSwipesLen) {
+                                        isSynced = true;
+                                    } else {
+                                        logDebug(`[Backup #${attemptId.toString().slice(-6)}] STANDARD unsynced: swipe_id (C:${clientLastMsg.swipe_id} vs S:${serverLastMsg.swipe_id}) or swipes.length (C:${clientSwipesLen} vs S:${serverSwipesLen}) mismatch.`);
+                                    }
+                                } else { // User message
+                                    isSynced = true;
+                                }
+                            } else { 
+                                logDebug(`[Backup #${attemptId.toString().slice(-6)}] STANDARD unsynced: last msg content/user mismatch.`); 
+                            }
+                        } else { 
+                            isSynced = true; // Both empty
+                        }
+                    }
+                } else if (backupType === BACKUP_TYPE.SWIPE) {
+                    if (clientChatMessages.length === serverChatMessages.length && clientChatMessages.length > 0) {
+                        const clientLastMsg = clientChatMessages[clientChatMessages.length - 1];
+                        const serverLastMsg = serverChatMessages[serverChatMessages.length - 1];
+                        const clientSwipes = clientLastMsg.swipes || [];
+                        const serverSwipes = serverLastMsg.swipes || [];
+                        if (clientLastMsg.swipe_id === serverLastMsg.swipe_id && clientSwipes.length === serverSwipes.length) {
+                            if (clientSwipes.length > 0 && clientLastMsg.swipe_id < clientSwipes.length && serverLastMsg.swipe_id < serverSwipes.length) {
+                                if (clientSwipes[clientLastMsg.swipe_id] === serverSwipes[serverLastMsg.swipe_id]) {
+                                    isSynced = true;
+                                } else { 
+                                    logDebug(`[Backup #${attemptId.toString().slice(-6)}] SWIPE unsynced: current swipe content mismatch.`); 
+                                }
+                            } else if (clientSwipes.length === 0) { // Both have no swipes, e.g. user message accidentally marked as SWIPE type
+                                isSynced = true;
+                            }
+                        } else { 
+                            logDebug(`[Backup #${attemptId.toString().slice(-6)}] SWIPE unsynced: swipe_id or swipes.length mismatch.`); 
+                        }
+                    } else if (clientChatMessages.length === 0 && serverChatMessages.length === 0) { 
+                        isSynced = true; 
+                    }
+                }
+
+                if (isSynced) {
+                    logDebug(`[Backup #${attemptId.toString().slice(-6)}] Synced after ${pollAttempts} attempt(s).`);
+                } else if (pollAttempts < MAX_POLL_ATTEMPTS) {
+                    logDebug(`[Backup #${attemptId.toString().slice(-6)}] Not synced, waiting ${POLL_INTERVAL_MS}ms...`);
+                    if (currentBackupAttemptId !== attemptId) { 
+                        logDebug(`[Backup #${attemptId.toString().slice(-6)}] Cancelled while waiting for next poll.`); 
+                        return false; 
+                    }
+                    await new Promise(resolve => setTimeout(resolve, POLL_INTERVAL_MS));
+                }
+            } // End polling loop
+
+            if (currentBackupAttemptId !== attemptId && !isSynced) {
+                logDebug(`[Backup #${attemptId.toString().slice(-6)}] Cancelled after polling (not synced).`); 
+                return false;
+            }
+            
+            if (!isSynced) {
+                logDebug(`[Backup #${attemptId.toString().slice(-6)}] NOT synced after ${MAX_POLL_ATTEMPTS} attempts. Using last API data.`);
+                toastr.warning(`备份警告: 数据同步不完美，备份可能略旧`, '聊天自动备份', {timeOut: 7000});
+            }
+            
+            fullChatContentArray = serverChatContentArray;
+            originalChatMessagesCount = serverChatMessages.length;
         } else {
-            console.error('[聊天自动备份] (封装) 无法确定当前是角色还是群组聊天进行备份，将使用空元数据');
-            metadataRef = {}; // 确保 metadataRef 有定义
+            // 非强制保存，直接获取API数据，不进行轮询
+            logDebug(`[Backup #${attemptId.toString().slice(-6)}] 跳过轮询 (forceSave=false)，直接获取API数据...`);
+            
+            try {
+                const context = getContext();
+                if (context.groupId) {
+                    const group = context.groups?.find(g => g.id === context.groupId);
+                    const effectiveGroupChatId = group?.chat_id || context.chatId;
+                    if (!effectiveGroupChatId) throw new Error(`Group chat ID not found for group ${context.groupId}`);
+                    
+                    const messagesFromAPI = await fetchGroupChatMessages(group.id, effectiveGroupChatId);
+                    if (!messagesFromAPI) throw new Error("API for group messages returned null");
+                    
+                    const groupChatMetadata = structuredClone(context.chatMetadata || {});
+                    fullChatContentArray = [groupChatMetadata, ...messagesFromAPI];
+                    originalChatMessagesCount = messagesFromAPI.length;
+                } else if (context.characterId !== undefined) {
+                    const character = characters[context.characterId];
+                    const effectiveCharChatFile = character?.chat || context.chatId;
+                    if (!effectiveCharChatFile) throw new Error(`Character chat file not found for charId ${context.characterId}`);
+                    
+                    fullChatContentArray = await fetchCharacterChatContent(character.name, effectiveCharChatFile, character.avatar);
+                    if (!fullChatContentArray || fullChatContentArray.length === 0) throw new Error("API for character chat returned null or empty");
+                    
+                    originalChatMessagesCount = fullChatContentArray.length - 1; // 第一个是元数据
+                } else {
+                    throw new Error("Cannot determine entity type for API call.");
+                }
+            } catch (error) {
+                console.error(`[Backup #${attemptId.toString().slice(-6)}] 获取API数据失败:`, error);
+                // 添加toastr提示，统一错误反馈方式
+                toastr.error(`备份失败: ${error.message || '获取API数据出错'}`, '聊天自动备份');
+                return false;
+            }
         }
-        messagesRef = contextSnapshot.chat || [];
-        originalChatMessagesCount = messagesRef.length; // 在这里获取消息数
 
-        // 简单验证是否有内容可备份 (基于消息数量)
-        if (messagesRef.length === 0 && Object.keys(metadataRef).length === 0) {
-             logDebug(`(封装) 从 getContext 获取的元数据和消息均为空，取消备份。ChatKey: ${chatKey}`);
-             return false;
+        if (!fullChatContentArray) { 
+            console.error(`[Backup #${attemptId.toString().slice(-6)}] 无有效的聊天内容数据`);
+            return false; 
         }
-        logDebug(`(封装) 准备发送到 Worker: 元数据引用 (keys: ${Object.keys(metadataRef).length}), 消息引用 (count: ${messagesRef.length})`);
 
-    } catch (dataPrepError) {
-        console.error('[聊天自动备份] (封装) 准备发送到 Worker 的数据时出错:', dataPrepError);
-        toastr.error(`备份失败：准备数据出错 - ${dataPrepError.message}`, '聊天自动备份');
-        return false;
-    }
+        const lastMsgIndex = originalChatMessagesCount > 0 ? originalChatMessagesCount - 1 : -1; //消息数组的索引
+        const lastMessage = lastMsgIndex >= 0 && fullChatContentArray.length > 1 ? fullChatContentArray[lastMsgIndex+1] : null; // +1 因为元数据在前面
+        const lastMessagePreview = lastMessage?.mes?.substring(0, 100) || (originalChatMessagesCount > 0 ? '(消息内容获取失败)' : '(空聊天)');
 
-    // --- lastMessagePreview 的计算需要在这里进行，基于引用 ---
-    const lastMsgIndex = originalChatMessagesCount > 0 ? originalChatMessagesCount - 1 : -1;
-    const lastMessageObject = lastMsgIndex >= 0 && messagesRef.length > lastMsgIndex ? messagesRef[lastMsgIndex] : null;
-    const lastMessagePreview = lastMessageObject?.mes?.substring(0, 100) || (originalChatMessagesCount > 0 ? '(消息内容获取失败)' : '(空聊天)');
-
-
-    let copiedFullChatContentArray; // 这是 Worker 返回的结果 [metadata_clone, ...messages_clone]
-
-    try {
+        // 2. 使用 Worker 进行高效数据处理 (保留API获取的fullChatContentArray)
+        let copiedFullChatContentArray;
         if (backupWorker) {
-            console.time('[聊天自动备份] Web Worker 处理时间 (postMessage + Worker内部构造)');
-            logDebug('(封装) 请求 Worker 处理数据 (传递引用)...');
-            // --- 步骤 2: 调用 Worker，传递【引用】 ---
-            copiedFullChatContentArray = await performDeepCopyInWorker(metadataRef, messagesRef);
-            console.timeEnd('[聊天自动备份] Web Worker 处理时间 (postMessage + Worker内部构造)');
-            logDebug('(封装) 从 Worker 收到处理后的 finalChatFileContent');
+            try {
+                console.time('[聊天自动备份] Web Worker 处理时间');
+                logDebug(`[Backup #${attemptId.toString().slice(-6)}] 请求 Worker 处理 API获取的聊天数据（利用结构化克隆）...`);
+                // Worker仅作为数据传递中介，利用postMessage的两次隐式克隆
+                copiedFullChatContentArray = await performDeepCopyInWorker(fullChatContentArray);
+                console.timeEnd('[聊天自动备份] Web Worker 处理时间');
+                logDebug(`[Backup #${attemptId.toString().slice(-6)}] 从 Worker 收到处理后的聊天数据`);
+            } catch(workerError) {
+                console.error(`[Backup #${attemptId.toString().slice(-6)}] Worker 处理失败，将尝试在主线程处理:`, workerError);
+                console.time('[聊天自动备份] 主线程处理时间 (Worker失败后)');
+                try { 
+                    copiedFullChatContentArray = structuredClone(fullChatContentArray); 
+                } catch (scError) { 
+                    copiedFullChatContentArray = JSON.parse(JSON.stringify(fullChatContentArray));
+                }
+                console.timeEnd('[聊天自动备份] 主线程处理时间 (Worker失败后)');
+            }
         } else {
-            // --- Worker 不可用，主线程回退 ---
-            console.warn('[聊天自动备份] (封装) Worker 不可用，在主线程执行深拷贝和构造...');
-            console.time('[聊天自动备份] 主线程深拷贝和构造时间 (无Worker)');
-            const clonedMetadataMainThread = structuredClone(metadataRef);
-            const clonedMessagesMainThread = structuredClone(messagesRef);
-            copiedFullChatContentArray = [clonedMetadataMainThread, ...clonedMessagesMainThread];
-            console.timeEnd('[聊天自动备份] 主线程深拷贝和构造时间 (无Worker)');
+            console.time('[聊天自动备份] 主线程处理时间 (无Worker)');
+            try { 
+                copiedFullChatContentArray = structuredClone(fullChatContentArray); 
+            } catch (scError) { 
+                copiedFullChatContentArray = JSON.parse(JSON.stringify(fullChatContentArray));
+            }
+            console.timeEnd('[聊天自动备份] 主线程处理时间 (无Worker)');
+        }
+        
+        if (!copiedFullChatContentArray) {
+            throw new Error("未能获取有效的聊天数据副本 (fullChatContentArray)");
         }
 
-        if (!copiedFullChatContentArray || !Array.isArray(copiedFullChatContentArray) || copiedFullChatContentArray.length === 0) {
-             throw new Error("未能从 Worker 或主线程回退中获取有效的聊天数据副本");
-        }
-        // originalChatMessagesCount 应该从 copiedFullChatContentArray[1...] 的长度再次确认，或者信任 Worker 的构造
-        // 但由于我们已在前面从 messagesRef 获取了 originalChatMessagesCount，这里可以沿用
-
-    } catch (processingError) { // 捕获 Worker 错误或主线程回退错误
-        console.error('[聊天自动备份] (封装) Worker 处理或主线程回退深拷贝时出错:', processingError);
-        toastr.error(`备份失败：数据处理错误 - ${processingError.message}`, '聊天自动备份');
-        return false;
-    }
-    
-    // --- 后续逻辑 (构建备份对象、保存、清理) 基于 copiedFullChatContentArray ---
-    try {
+        // 3. 构建备份对象
         const backup = {
             timestamp: currentTimestamp,
-            chatKey,
+            chatKey, // 保持 chatKey 用于识别备份属于哪个原始聊天
             entityName,
             chatName,
-            lastMessageId: lastMsgIndex, // 使用之前基于引用的计算
-            lastMessagePreview,       // 使用之前基于引用的计算
-            chatFileContent: copiedFullChatContentArray,
+            lastMessageId: lastMsgIndex, // 基于消息数量
+            lastMessagePreview,
+            // 存储完整的聊天文件内容数组
+            chatFileContent: copiedFullChatContentArray, // [metadata, ...messages]
         };
-        logDebug(`(封装) 构建的备份对象:`, {timestamp: backup.timestamp, chatKey: backup.chatKey, entityName: backup.entityName, chatName: backup.chatName, lastMessageId: backup.lastMessageId, preview: backup.lastMessagePreview, contentItems: backup.chatFileContent.length });
+        logDebug(`[Backup #${attemptId.toString().slice(-6)}] 构建的备份对象:`, {timestamp: backup.timestamp, chatKey: backup.chatKey, entityName: backup.entityName, chatName: backup.chatName, lastMessageId: backup.lastMessageId, preview: backup.lastMessagePreview, contentItems: backup.chatFileContent.length });
 
+        // 4. 检查当前聊天是否已有基于最后消息ID的备份 (避免完全相同的备份)
         const existingBackups = await getBackupsForChat(chatKey);
-        const existingBackupIndex = existingBackups.findIndex(b => b.lastMessageId === lastMsgIndex && b.lastMessageId !== -1);
+        const existingBackupIndex = existingBackups.findIndex(b => b.lastMessageId === lastMsgIndex && b.lastMessageId !== -1); // 只有在有消息时才比较
         let needsSave = true;
 
         if (lastMsgIndex !== -1 && existingBackupIndex !== -1) {
             const existingTimestamp = existingBackups[existingBackupIndex].timestamp;
             if (backup.timestamp > existingTimestamp) {
+                logDebug(`[Backup #${attemptId.toString().slice(-6)}] 发现旧备份 (ID ${lastMsgIndex}, 时间 ${existingTimestamp}), 将删除旧的以保存新的 (时间 ${backup.timestamp})`);
                 await deleteBackup(chatKey, existingTimestamp);
             } else {
+                logDebug(`[Backup #${attemptId.toString().slice(-6)}] 发现更新或相同的备份 (ID ${lastMsgIndex}, 时间 ${existingTimestamp} vs ${backup.timestamp}), 跳过保存`);
                 needsSave = false;
             }
         }
 
         if (!needsSave) {
-            logDebug('(封装) 无需保存 (已存在或无更新), 跳过保存和清理');
+            logDebug(`[Backup #${attemptId.toString().slice(-6)}] 无需保存 (已存在或无更新), 跳过保存和清理`);
             return false;
         }
 
+        // 5. 保存新的备份
         await saveBackupToDB(backup);
-        logDebug(`(封装) 新备份已保存: [${chatKey}, ${backup.timestamp}]`);
+        logDebug(`[Backup #${attemptId.toString().slice(-6)}] 新备份已保存: [${chatKey}, ${backup.timestamp}]`);
 
+        // 6. 清理旧备份
+        logDebug(`[Backup #${attemptId.toString().slice(-6)}] 检查备份总数是否超出系统限制 (${settings.maxTotalBackups})`);
         const allBackupKeys = await getAllBackupKeys();
         if (allBackupKeys.length > settings.maxTotalBackups) {
+            logDebug(`[Backup #${attemptId.toString().slice(-6)}] 备份总数 (${allBackupKeys.length}) 超出限制 (${settings.maxTotalBackups})`);
             allBackupKeys.sort((a, b) => a[1] - b[1]);
             const numToDelete = allBackupKeys.length - settings.maxTotalBackups;
             const keysToDelete = allBackupKeys.slice(0, numToDelete);
+            logDebug(`[Backup #${attemptId.toString().slice(-6)}] 准备删除 ${keysToDelete.length} 个最旧的备份`);
             await Promise.all(keysToDelete.map(key => deleteBackup(key[0], key[1])));
-            logDebug(`(封装) ${keysToDelete.length} 个旧备份已删除`);
+            logDebug(`[Backup #${attemptId.toString().slice(-6)}] ${keysToDelete.length} 个旧备份已删除`);
+        } else {
+            logDebug(`[Backup #${attemptId.toString().slice(-6)}] 备份总数 (${allBackupKeys.length}) 未超出限制，无需清理`);
         }
 
-        logDebug(`(封装) 聊天备份和潜在清理成功: ${entityName} - ${chatName}`);
+        logDebug(`[Backup #${attemptId.toString().slice(-6)}] 聊天备份和潜在清理成功: ${entityName} - ${chatName}`);
         return true;
 
-    } catch (saveError) {
-        console.error('[聊天自动备份] (封装) 保存备份或清理过程中发生严重错误:', saveError);
-        toastr.error(`备份失败：保存或清理错误 - ${saveError.message}`, '聊天自动备份');
-        throw saveError; // 重新抛出，让 performBackupConditional 捕获
+    } catch (error) {
+        console.error(`[Backup #${attemptId.toString().slice(-6)}] 核心备份或清理过程中发生严重错误:`, error);
+        throw error;
+    } finally {
+        isBackupInProgress = false;
+        logDebug(`[Backup #${attemptId.toString().slice(-6)}] Released isBackupInProgress lock in executeBackupLogic_Core's finally.`);
     }
 }
 
-
 // --- Conditional backup function ---
-async function performBackupConditional() {
-    if (isBackupInProgress) {
-        logDebug('Backup is already in progress, skipping this request');
-        return;
-    }
+async function performBackupConditional(backupType = BACKUP_TYPE.STANDARD, forceSave = false) {
+    const localAttemptId = Date.now() + Math.random(); // 增加随机数确保唯一性
+    currentBackupAttemptId = localAttemptId; 
+    logDebug(`[Backup #${localAttemptId.toString().slice(-6)}] performBackupConditional called. Type: ${backupType}, ForceSave: ${forceSave}`);
 
-    // Get current settings, including debounce delay, in case they were modified during the delay
     const currentSettings = extension_settings[PLUGIN_NAME];
     if (!currentSettings) {
         console.error('[聊天自动备份] Could not get current settings, cancelling backup');
         return false;
     }
 
-    logDebug('Performing conditional backup (performBackupConditional)');
-    clearTimeout(backupTimeout); // Cancel any pending debounced backups
-    backupTimeout = null;
-
-    const context = getContext();
     const chatKey = getCurrentChatKey();
-
     if (!chatKey) {
-        logDebug('Could not get a valid chat identifier, cancelling backup');
-        console.warn('[聊天自动备份] Cancellation Details (No ChatKey):', {
-             contextDefined: !!context,
-             chatMetadataDefined: !!context?.chatMetadata,
-             sheetsDefined: !!context?.chatMetadata?.sheets,
-             isSheetsArray: Array.isArray(context?.chatMetadata?.sheets),
-             sheetsLength: context?.chatMetadata?.sheets?.length,
-             condition1: !context?.chatMetadata,
-             condition2: !context?.chatMetadata?.sheets,
-             condition3: context?.chatMetadata?.sheets?.length === 0
-         });
+        logDebug(`[Backup #${localAttemptId.toString().slice(-6)}] Could not get a valid chat identifier, cancelling backup`);
         return false;
     }
     
-    if (!context.chatMetadata) {
-        console.warn('[聊天自动备份] chatMetadata is invalid, cancelling backup');
-        console.warn('[聊天自动备份] Cancellation Details (chatMetadata Invalid):', {
-             contextDefined: !!context, chatMetadataDefined: !!context?.chatMetadata
-         });
-        return false;
-     }
-
-    isBackupInProgress = true;
-    logDebug('Setting backup lock');
     try {
-        // 修改：直接调用，让 executeBackupLogic_Core 内部获取数据
-        const success = await executeBackupLogic_Core(currentSettings);
+        // 仅在forceSave为true时调用saveChatConditional
+        if (forceSave) {
+            logDebug(`[Backup #${localAttemptId.toString().slice(-6)}] Force saving chat...`);
+            await saveChatConditional();
+            logDebug(`[Backup #${localAttemptId.toString().slice(-6)}] saveChatConditional completed.`);
+        } else {
+            logDebug(`[Backup #${localAttemptId.toString().slice(-6)}] Skipping force save.`);
+        }
+
+        // 在调用轮询核心前再次检查是否已被取消
+        if (currentBackupAttemptId !== localAttemptId) {
+            logDebug(`[Backup #${localAttemptId.toString().slice(-6)}] Cancelled before calling executeBackupLogic_Core.`);
+            return false; 
+        }
+        
+        // 传递forceSave参数
+        const success = await executeBackupLogic_Core(currentSettings, backupType, localAttemptId, forceSave);
+        
         if (success) {
             await updateBackupsList();
         }
         return success;
     } catch (error) {
-        console.error('[聊天自动备份] Conditional backup execution failed:', error);
+        console.error(`[Backup #${localAttemptId.toString().slice(-6)}] Conditional backup execution failed:`, error);
         toastr.error(`Backup failed: ${error.message || 'Unknown error'}`, 'Chat Auto Backup');
         return false;
-    } finally {
-        isBackupInProgress = false;
-        logDebug('Releasing backup lock');
     }
 }
 
-
 // --- Debounced backup function (similar to saveChatDebounced) ---
-function performBackupDebounced() {
+function performBackupDebounced(backupType = BACKUP_TYPE.STANDARD) {
     // Get the context and settings at the time of scheduling
     const scheduledChatKey = getCurrentChatKey();
     const currentSettings = extension_settings[PLUGIN_NAME];
@@ -637,7 +865,7 @@ function performBackupDebounced() {
 
     const delay = currentSettings.backupDebounceDelay; // Use the current settings' delay
 
-    logDebug(`Scheduling debounced backup (delay ${delay}ms), for ChatKey: ${scheduledChatKey}`);
+    logDebug(`Scheduling debounced backup (delay ${delay}ms), for ChatKey: ${scheduledChatKey}, Type: ${backupType}`);
     clearTimeout(backupTimeout); // Clear the old timer
 
     backupTimeout = setTimeout(async () => {
@@ -650,33 +878,30 @@ function performBackupDebounced() {
             return; // Abort backup
         }
 
-        logDebug(`Executing delayed backup operation (from debounce), ChatKey: ${currentChatKey}`);
-        // Only perform conditional backup if context matches
-        await performBackupConditional().catch(error => {
+        logDebug(`Executing delayed backup operation (from debounce), ChatKey: ${currentChatKey}, Type: ${backupType}`);
+        // 防抖备份不强制保存
+        await performBackupConditional(backupType, false).catch(error => {
             console.error(`[聊天自动备份] 防抖备份事件 ${currentChatKey} 处理失败:`, error);
         });
         backupTimeout = null; // Clear the timer ID
     }, delay);
 }
 
-
 // --- Manual backup ---
 async function performManualBackup() {
     console.log('[聊天自动备份] Performing manual backup (calling conditional function)');
     try {
-         await performBackupConditional(); // Manual backup also goes through conditional check and lock logic
+         await performBackupConditional(BACKUP_TYPE.STANDARD, true); // 手动备份使用强制保存
          toastr.success('Manual backup of current chat completed', 'Chat Auto Backup');
     } catch (error) {
-         // The conditional function already shows an error toast, but log here too.
          console.error('[聊天自动备份] Manual backup failed:', error);
     }
 }
 
-
 // --- Restore logic ---
 async function restoreBackup(backupData) {
-    logDebug('[聊天自动备份] 开始恢复备份:', { chatKey: backupData.chatKey, timestamp: backupData.timestamp });
-    logDebug('[聊天自动备份] 备份数据从本地获取，无需API请求获取数据');
+    logDebug('[聊天自动备份] 开始通过导入API恢复备份:', { chatKey: backupData.chatKey, timestamp: backupData.timestamp });
+    logDebug('[聊天自动备份] 原始备份数据:', JSON.parse(JSON.stringify(backupData)));
 
     // 验证备份数据完整性
     if (!backupData.chatFileContent || !Array.isArray(backupData.chatFileContent) || backupData.chatFileContent.length === 0) {
@@ -860,7 +1085,7 @@ async function restoreBackup(backupData) {
             
             toastr.success(`备份已作为新聊天 "${newChatIdForRole}" 恢复到角色 "${targetCharacter.name}"！`);
             success = true;
-                    } else {
+        } else {
             toastr.error('未选择任何角色或群组，无法确定恢复目标。', '恢复失败');
             return false;
         }
@@ -874,7 +1099,7 @@ async function restoreBackup(backupData) {
         }
         return success;
 
-        } catch (error) {
+    } catch (error) {
         console.error(`[聊天自动备份] 通过导入API恢复备份时发生严重错误:`, error);
         toastr.error(`恢复备份失败: ${error.message}`, '恢复失败');
         return false;
@@ -970,7 +1195,7 @@ jQuery(async () => {
         try {
             const blob = new Blob([deepCopyLogicString], { type: 'application/javascript' });
             backupWorker = new Worker(URL.createObjectURL(blob));
-            console.log('[聊天自动备份] Web Worker 已创建');
+            console.log('[聊天自动备份] Web Worker 已创建（优化版本 - 利用隐式克隆）');
 
             // 设置 Worker 消息处理器 (主线程)
             backupWorker.onmessage = function(e) {
@@ -1189,7 +1414,6 @@ jQuery(async () => {
                 });
 
                 if (backup && backup.chatFileContent && Array.isArray(backup.chatFileContent) && backup.chatFileContent.length > 1) {
-                    logDebug('[聊天自动备份] 直接使用已保存的备份数据展示预览，无需API请求');
                     // 提取消息 (跳过索引0的元数据)
                     const messages = backup.chatFileContent.slice(1);
                     
@@ -1336,57 +1560,68 @@ jQuery(async () => {
     
     // 设置备份事件监听
     const setupBackupEvents = () => {
-        console.log('[聊天自动备份] 设置备份事件监听');
+        console.log('[聊天自动备份] 设置备份事件监听 (优化版)');
         
-        // 立即触发备份的事件 (状态明确结束)
-        const immediateBackupEvents = [
-            event_types.MESSAGE_SENT,           // 用户发送消息后
-            event_types.GENERATION_ENDED,       // AI生成完成并添加消息后
-            event_types.CHARACTER_FIRST_MESSAGE_SELECTED, // 选择角色第一条消息时                
-        ].filter(Boolean); // 过滤掉可能不存在的事件类型
+        // 只有生成结束事件使用强制保存
+        if (event_types.GENERATION_ENDED) {
+            eventSource.on(event_types.GENERATION_ENDED, () => {
+                logDebug(`Event: GENERATION_ENDED`);
+                performBackupConditional(BACKUP_TYPE.STANDARD, true).catch(e => console.error("GENERATION_ENDED backup error", e));
+            });
+        }
 
-        // 触发防抖备份的事件 (编辑性操作)
-        const debouncedBackupEvents = [
-            event_types.MESSAGE_EDITED,        // 编辑消息后 (防抖)
-            event_types.MESSAGE_DELETED,       // 删除消息后 (防抖)
-            event_types.MESSAGE_SWIPED,         // 用户切换AI回复后 (防抖)
-            event_types.IMAGE_SWIPED,           // 图片切换 (防抖)
-            event_types.MESSAGE_FILE_EMBEDDED, // 文件嵌入 (防抖)
-            event_types.MESSAGE_REASONING_EDITED, // 编辑推理 (防抖)
-            event_types.MESSAGE_REASONING_DELETED, // 删除推理 (防抖)
-            event_types.FILE_ATTACHMENT_DELETED, // 附件删除 (防抖)
-            event_types.GROUP_UPDATED, // 群组元数据更新 (防抖)
+        // 用户发送消息事件，立即备份但不强制保存
+        if (event_types.GENERATION_STARTED) {
+            eventSource.on(event_types.GENERATION_STARTED, () => {
+                logDebug(`Event: GENERATION_STARTED`);
+                performBackupConditional(BACKUP_TYPE.STANDARD, false).catch(e => console.error("GENERATION_STARTED backup error", e));
+            });
+        }
+        
+        // CHARACTER_FIRST_MESSAGE_SELECTED改为防抖备份
+        if (event_types.CHARACTER_FIRST_MESSAGE_SELECTED) {
+            eventSource.on(event_types.CHARACTER_FIRST_MESSAGE_SELECTED, () => {
+                logDebug(`Event: CHARACTER_FIRST_MESSAGE_SELECTED`);
+                performBackupDebounced(BACKUP_TYPE.STANDARD);
+            });
+        }
+
+        // 消息切换仍然是防抖备份SWIPE类型
+        if (event_types.MESSAGE_SWIPED) {
+            eventSource.on(event_types.MESSAGE_SWIPED, () => {
+                logDebug(`Event: MESSAGE_SWIPED`);
+                performBackupDebounced(BACKUP_TYPE.SWIPE); 
+            });
+        }
+        
+        // 消息更新仍然是防抖备份
+        if (event_types.MESSAGE_UPDATED) { 
+            eventSource.on(event_types.MESSAGE_UPDATED, () => {
+                logDebug(`Event: MESSAGE_UPDATED`);
+                performBackupDebounced(BACKUP_TYPE.STANDARD);
+            });
+        }
+
+        // 其他防抖事件
+        const otherDebouncedEvents = [
+            event_types.IMAGE_SWIPED,
+            event_types.MESSAGE_FILE_EMBEDDED,
+            event_types.MESSAGE_REASONING_EDITED, 
+            event_types.MESSAGE_REASONING_DELETED, 
+            event_types.FILE_ATTACHMENT_DELETED, 
+            event_types.GROUP_UPDATED
         ].filter(Boolean);
 
-        console.log('[聊天自动备份] 设置立即备份事件监听:', immediateBackupEvents);
-        immediateBackupEvents.forEach(eventType => {
-            if (!eventType) {
-                console.warn('[聊天自动备份] 检测到未定义的立即备份事件类型');
-                return;
-            }
-            eventSource.on(eventType, () => {
-                logDebug(`事件触发 (立即备份): ${eventType}`);
-                // 使用新的条件备份函数
-                performBackupConditional().catch(error => {
-                    console.error(`[聊天自动备份] 立即备份事件 ${eventType} 处理失败:`, error);
+        otherDebouncedEvents.forEach(eventType => {
+            if (eventType) {
+                eventSource.on(eventType, () => {
+                    logDebug(`Event (Other Debounced): ${eventType}`);
+                    performBackupDebounced(BACKUP_TYPE.STANDARD); 
                 });
-            });
-        });
-
-        console.log('[聊天自动备份] 设置防抖备份事件监听:', debouncedBackupEvents);
-        debouncedBackupEvents.forEach(eventType => {
-            if (!eventType) {
-                console.warn('[聊天自动备份] 检测到未定义的防抖备份事件类型');
-                return;
             }
-            eventSource.on(eventType, () => {
-                logDebug(`事件触发 (防抖备份): ${eventType}`);
-                // 使用新的防抖备份函数
-                performBackupDebounced();
-            });
         });
-
-        console.log('[聊天自动备份] 事件监听器设置完成');
+        
+        logDebug('优化后的备份事件监听器设置完成。');
     };
     
     // 执行初始备份检查
@@ -1396,7 +1631,7 @@ jQuery(async () => {
             const context = getContext();
             if (context.chat && context.chat.length > 0 && !isBackupInProgress) {
                 logDebug('[聊天自动备份] 发现现有聊天记录，执行初始备份');
-                await performBackupConditional(); // 使用条件函数
+                await performBackupConditional(BACKUP_TYPE.STANDARD, true); // 初始备份应使用强制保存
             } else {
                 logDebug('[聊天自动备份] 当前没有聊天记录或备份进行中，跳过初始备份');
             }
