@@ -1,10 +1,9 @@
 // Chat Auto Backup 插件 - 自动保存和恢复最近三次聊天记录
 // 主要功能：
-// 1. 自动保存最近聊天记录到IndexedDB (基于事件触发, 区分立即与防抖)
+// 1. 自动保存最近聊天记录到IndexedDB (基于事件触发, 区分立即与防抖, 直接从内存获取数据)
 // 2. 在插件页面显示保存的记录
 // 3. 提供恢复功能，将保存的聊天记录恢复到新的聊天中F
 // 4. 使用Web Worker优化深拷贝性能
-// 5. 利用记忆表格插件自身的导入/导出机制，实现表格的备份与恢复
 
 import {
     getContext,
@@ -21,30 +20,42 @@ import {
     doNewChat,              // 用于创建新聊天
     printMessages,          // 用于刷新聊天UI
     scrollChatToBottom,     // 用于滚动到底部
-    updateChatMetadata,     // 用于更新聊天元数据 - Note: Standard ST function, may not work as expected with plugin metadata proxies
+    updateChatMetadata,     // 用于更新聊天元数据
     saveChatConditional,    // 用于保存聊天
     saveChat,               // 用于插件强制保存聊天
     characters,             // 需要访问角色列表来查找索引
-    getThumbnailUrl,        // 可能需要获取头像URL（虽然备份里应该有）
-    // --- 其他可能需要的函数 ---
-    // clearChat, // 可能不需要，doNewChat 应该会处理
-    // getCharacters, // 切换角色后可能需要更新？selectCharacterById 内部应该会处理
+    getThumbnailUrl,        // 可能需要获取头像URL
+    getRequestHeaders,      // 用于API请求的头部
+    openCharacterChat,      // 用于打开角色聊天
 } from '../../../../script.js';
 
 import {
     // --- 群组相关函数 ---
     select_group_chats,     // 用于选择群组聊天
-    // getGroupChat, // 可能不需要，select_group_chats 应该会处理
 } from '../../../group-chats.js';
 
-// --- 导入表格插件的核心对象和函数 ---
-// Adjust the paths relative to your backup plugin's index.js
-import { BASE as TablePluginBASE } from '../st-memory-enhancement/core/manager.js';
-import { refreshContextView as tablePlugin_refreshContextView } from '../st-memory-enhancement/scripts/editor/chatSheetsDataView.js';
+// --- 新增：用于API交互的辅助函数 ---
 
+/**
+ * 将聊天元数据和消息数组构造成 .jsonl 格式的字符串
+ * @param {object} metadata - 聊天元数据对象
+ * @param {Array} messages - 聊天消息对象数组
+ * @returns {string} .jsonl 格式的字符串
+ */
+function constructJsonlString(metadata, messages) {
+    if (!metadata || !Array.isArray(messages)) {
+        console.error('[CONSTRUCT] 无效的元数据或消息数组传入 constructJsonlString');
+        return '';
+    }
+    let jsonlString = JSON.stringify(metadata) + '\n';
+    messages.forEach(message => {
+        jsonlString += JSON.stringify(message) + '\n';
+    });
+    return jsonlString;
+}
 
 // 扩展名和设置初始化
-const PLUGIN_NAME = 'chat-history-backup';
+const PLUGIN_NAME = 'chat-history-backupY3';
 const DEFAULT_SETTINGS = {
     maxTotalBackups: 10, // 整个系统保留的最大备份数量 (增加默认值，避免频繁清理)
     backupDebounceDelay: 1500, // 防抖延迟时间 (毫秒) (增加默认值，更稳定)
@@ -52,7 +63,7 @@ const DEFAULT_SETTINGS = {
 };
 
 // IndexedDB 数据库名称和版本
-const DB_NAME = 'ST_ChatAutoBackup';
+const DB_NAME = 'ST_ChatAutoBackupY3';
 const DB_VERSION = 1;
 const STORE_NAME = 'backups';
 
@@ -71,42 +82,23 @@ let backupTimeout = null;       // 防抖定时器 ID
 
 // --- 深拷贝逻辑 (将在Worker和主线程中使用) ---
 const deepCopyLogicString = `
-    const deepCopy = (obj) => {
-        try {
-            // structuredClone is the most robust way to deep copy in modern JS
-            return structuredClone(obj);
-        } catch (error) {
-            // Fallback to JSON methods if structuredClone fails (e.g. for non-serializable objects, though less common in ST chat data)
-            try {
-                return JSON.parse(JSON.stringify(obj));
-            } catch (jsonError) {
-                // If JSON methods also fail, re-throw the original error or a new one
-                console.error("Deep copy failed using JSON methods:", jsonError);
-                // You might want to throw the original error for better debugging context,
-                // but re-throwing a generic error is safer if the original error object is complex.
-                throw new Error("Failed to deep copy object using JSON serialization.");
-            }
-        }
-    };
-
-    // Worker message handler
+    // Worker message handler - 优化版本，分离metadata和messages处理
     self.onmessage = function(e) {
         const { id, payload } = e.data;
-        // console.log('[Worker] Received message with ID:', id); // Log removed for less noise
         if (!payload) {
-             // console.error('[Worker] Invalid payload received'); // Log removed for less noise
              self.postMessage({ id, error: 'Invalid payload received by worker' });
              return;
         }
         try {
-            // Perform deep copy on the payload
-            const copiedPayload = deepCopy(payload);
-            // console.log('[Worker] Deep copy successful for ID:', id); // Log removed for less noise
-            // Send the copied payload back
-            self.postMessage({ id, result: copiedPayload });
+            // payload中的metadata和messages已经是通过postMessage的结构化克隆获得的副本
+            // 只需要构建最终备份数组结构，无需额外深拷贝
+            const finalChatFileContent = [payload.metadata, ...payload.messages];
+            
+            // 发送构建好的数组结构
+            self.postMessage({ id, result: finalChatFileContent });
         } catch (error) {
-            console.error('[Worker] Error during deep copy for ID:', id, error); // Keep error log
-            self.postMessage({ id, error: error.message || 'Worker deep copy failed' });
+            console.error('[Worker] Error during data processing for ID:', id, error);
+            self.postMessage({ id, error: error.message || 'Worker processing failed' });
         }
     };
 `;
@@ -396,7 +388,7 @@ function getCurrentChatInfo() {
 
 // --- Web Worker 通信 ---
 // 发送数据到 Worker 并返回包含拷贝后数据的 Promise
-function performDeepCopyInWorker(payload) {
+function performDeepCopyInWorker(metadata, messages) {
     return new Promise((resolve, reject) => {
         if (!backupWorker) {
             return reject(new Error("Backup worker not initialized."));
@@ -405,12 +397,15 @@ function performDeepCopyInWorker(payload) {
         const currentRequestId = ++workerRequestId;
         workerPromises[currentRequestId] = { resolve, reject };
 
-        logDebug(`[主线程] 发送数据到 Worker (ID: ${currentRequestId}), Payload size: ${JSON.stringify(payload).length}`);
+        logDebug(`[主线程] 发送数据到 Worker (ID: ${currentRequestId}), Metadata size: ${JSON.stringify(metadata).length}, Messages count: ${messages.length}`);
         try {
-            // 发送需要拷贝的数据
+            // 分离发送元数据和消息，利用postMessage的隐式克隆
             backupWorker.postMessage({
                 id: currentRequestId,
-                payload: payload
+                payload: {
+                    metadata: metadata,
+                    messages: messages
+                }
             });
         } catch (error) {
              console.error(`[主线程] 发送消息到 Worker 失败 (ID: ${currentRequestId}):`, error);
@@ -420,224 +415,166 @@ function performDeepCopyInWorker(payload) {
     });
 }
 
-// --- 核心备份逻辑封装 (接收具体数据) ---
-async function executeBackupLogic_Core(chat, chat_metadata_to_backup, settings) {
+// --- 核心备份逻辑封装 ---
+async function executeBackupLogic_Core(settings) {
     const currentTimestamp = Date.now();
     logDebug(`(封装) 开始执行核心备份逻辑 @ ${new Date(currentTimestamp).toLocaleTimeString()}`);
 
-    // 1. 前置检查 (使用传入的数据，而不是 getContext())
-    const chatKey = getCurrentChatKey(); // 这个仍然需要获取当前的chatKey
+    const contextSnapshot = getContext(); // 获取一次快照
+    const chatKey = getCurrentChatKey(); // chatKey 仍然需要 contextSnapshot 或 getContext()
     if (!chatKey) {
-        console.warn('[聊天自动备份] (封装) 无有效的聊天标识符');
+        console.warn('[聊天自动备份] (封装) 无有效的聊天标识符，无法执行备份');
         return false;
     }
 
-    const { entityName, chatName } = getCurrentChatInfo();
-    const lastMsgIndex = chat.length - 1;
-    const lastMessage = chat[lastMsgIndex];
-    const lastMessagePreview = lastMessage?.mes?.substring(0, 100) || '(空消息)';
+    const { entityName, chatName } = getCurrentChatInfo(); // 这个也需要 contextSnapshot 或 getContext()
+    let originalChatMessagesCount = 0; // 将在这里或从 Worker 返回后确定
 
-    logDebug(`(封装) 准备备份聊天: ${entityName} - ${chatName}, 消息数: ${chat.length}, 最后消息ID: ${lastMsgIndex}`);
-    // *** 打印传入的元数据状态进行调试 ***
-    logDebug(`(封装) 备份的 chat_metadata_to_backup 状态:`, JSON.parse(JSON.stringify(chat_metadata_to_backup)));
+    logDebug(`(封装) 准备备份聊天: ${entityName} - ${chatName}`);
 
-    // --- 尝试生成表格插件的导入/导出格式数据进行备份 ---
-    let tablePluginExportData = null;
-    try {
-         // Use TablePluginBASE to get current Sheet instances
-         // This relies on the current context being set up correctly *before* this function is called
-         // Check if TablePluginBASE is available and has getChatSheets method
-         if (TablePluginBASE && typeof TablePluginBASE.getChatSheets === 'function') {
-              const currentSheets = TablePluginBASE.getChatSheets();
-              console.log('[聊天自动备份] (封装) 从 TablePluginBASE.getChatSheets() 获取到 Sheet 实例:', currentSheets);
-
-              if (currentSheets && currentSheets.length > 0) {
-                   tablePluginExportData = { mate: { type: "chatSheets", version: 1 } };
-                   currentSheets.forEach(sheetInstance => {
-                        // Call getJson() on each Sheet instance to get the import/export format
-                        // Based on sheet.js, getJson() generates the format with 'content' and 'sourceData'
-                        try {
-                            // Ensure sheetInstance is valid and has getJson method
-                            if (sheetInstance && typeof sheetInstance.getJson === 'function') {
-                                const sheetJson = sheetInstance.getJson();
-                                tablePluginExportData[sheetJson.uid] = sheetJson;
-                            } else {
-                                console.warn(`[聊天自动备份] (封装) 无效的 Sheet 实例或缺少 getJson 方法 for UID ${sheetInstance?.uid}. 跳过.`);
-                            }
-                        } catch (getSheetJsonError) {
-                            console.error(`[聊天自动备份] (封装) 调用 sheet.getJson() for ${sheetInstance?.uid} 时出错:`, getSheetJsonError);
-                            // Decide how to handle error - skip this sheet or fail backup? Let's skip this sheet for now.
-                            // If any sheet fails, perhaps mark the whole export data as incomplete?
-                            // For simplicity, we'll just log the error and continue with other sheets.
-                        }
-                   });
-                   // If no sheets were successfully processed, set tablePluginExportData back to null
-                   if (Object.keys(tablePluginExportData).length <= 1) { // Only contains 'mate'
-                        console.warn('[聊天自动备份] (封装) 没有表格实例成功生成导入/导出格式数据。');
-                        tablePluginExportData = null;
-                   } else {
-                        console.log('[聊天自动备份] (封装) 成功生成表格插件的导入/导出格式数据:', JSON.parse(JSON.stringify(tablePluginExportData)));
-                   }
-
-              } else {
-                   console.warn('[聊天自动备份] (封装) 当前聊天没有表格实例或获取失败，跳过生成导入/导出格式数据。');
-                   tablePluginExportData = null;
-              }
-         } else {
-              console.warn('[聊天自动备份] (封装) 表格插件的 BASE.getChatSheets 方法不可用，无法生成导入/导出格式数据。');
-              tablePluginExportData = null;
-         }
-    } catch (backupConversionError) {
-         console.error('[聊天自动备份] (封装) 生成表格插件导入/导出格式数据时发生未预料的错误:', backupConversionError);
-         tablePluginExportData = null;
-    }
-    // --- 生成导入/导出格式数据结束 ---
-
+    // --- 步骤 1: 准备发送给 Worker 的数据【引用】 ---
+    let metadataRef;
+    let messagesRef;
 
     try {
-        // 2. 使用 Worker 进行深拷贝 (拷贝原始 chat 和 chat_metadata_to_backup)
-        // Keep this as it backs up the standard ST chat data
-        let copiedChat, copiedMetadata;
-        if (backupWorker) {
-            try {
-                console.time('[聊天自动备份] Web Worker 深拷贝时间');
-                logDebug('(封装) 请求 Worker 执行深拷贝...');
-                // Pass the original chat and metadata to the worker
-                const result = await performDeepCopyInWorker({ chat: chat, metadata: chat_metadata_to_backup });
-                copiedChat = result.chat;
-                copiedMetadata = result.metadata;
-                console.timeEnd('[聊天自动备份] Web Worker 深拷贝时间');
-                logDebug('(封装) 从 Worker 收到拷贝后的数据');
-            } catch(workerError) {
-                 // Fallback to main thread if worker fails
-                 console.error('[聊天自动备份] (封装) Worker 深拷贝失败，将尝试在主线程执行:', workerError);
-                  console.time('[聊天自动备份] 主线程深拷贝时间 (Worker失败后)');
-                  try {
-                      copiedChat = structuredClone(chat);
-                      copiedMetadata = structuredClone(chat_metadata_to_backup); // Deep copy the original metadata
-                  } catch (structuredCloneError) {
-                     try {
-                         copiedChat = JSON.parse(JSON.stringify(chat));
-                         copiedMetadata = JSON.parse(JSON.stringify(chat_metadata_to_backup)); // Deep copy the original metadata
-                     } catch (jsonError) {
-                         console.error('[聊天自动备份] (封装) 主线程深拷贝也失败:', jsonError);
-                         throw new Error("无法完成聊天数据的深拷贝");
-                     }
-                  }
-                  console.timeEnd('[聊天自动备份] 主线程深拷贝时间 (Worker失败后)');
+        if (contextSnapshot.groupId) {
+            const group = contextSnapshot.groups?.find(g => g.id === contextSnapshot.groupId);
+            const groupMeta = group ? (group.chatMatedata || group.chat_metadata) : null;
+            if (groupMeta && typeof groupMeta === 'object') {
+                metadataRef = groupMeta;
+            } else if (contextSnapshot.chatMetadata && typeof contextSnapshot.chatMetadata === 'object') {
+                metadataRef = contextSnapshot.chatMetadata;
+                 logDebug(`[getContext] 群组特定元数据未找到，使用 context.chatMetadata 作为备选`);
+            } else {
+                metadataRef = {};
+                logDebug(`[getContext] 群组特定元数据和备选均未找到，使用空元数据对象`);
             }
+        } else if (contextSnapshot.characterId !== undefined) {
+            metadataRef = contextSnapshot.chatMetadata || {};
         } else {
-            // Worker not available, deep copy in main thread
-            console.time('[聊天自动备份] 主线程深拷贝时间 (无Worker)');
-             try {
-                 copiedChat = structuredClone(chat);
-                 copiedMetadata = structuredClone(chat_metadata_to_backup); // Deep copy the original metadata
-             } catch (structuredCloneError) {
-                try {
-                    copiedChat = JSON.parse(JSON.stringify(chat));
-                    copiedMetadata = JSON.parse(JSON.stringify(chat_metadata_to_backup)); // Deep copy the original metadata
-                } catch (jsonError) {
-                    console.error('[聊天自动备份] (封装) 主线程深拷贝失败:', jsonError);
-                    throw new Error("无法完成聊天数据的深拷贝");
-                }
-             }
-            console.timeEnd('[聊天自动备份] 主线程深拷贝时间 (无Worker)');
+            console.error('[聊天自动备份] (封装) 无法确定当前是角色还是群组聊天进行备份，将使用空元数据');
+            metadataRef = {}; // 确保 metadataRef 有定义
+        }
+        messagesRef = contextSnapshot.chat || [];
+        originalChatMessagesCount = messagesRef.length; // 在这里获取消息数
+
+        // 简单验证是否有内容可备份 (基于消息数量)
+        if (messagesRef.length === 0 && Object.keys(metadataRef).length === 0) {
+             logDebug(`(封装) 从 getContext 获取的元数据和消息均为空，取消备份。ChatKey: ${chatKey}`);
+             return false;
+        }
+        logDebug(`(封装) 准备发送到 Worker: 元数据引用 (keys: ${Object.keys(metadataRef).length}), 消息引用 (count: ${messagesRef.length})`);
+
+    } catch (dataPrepError) {
+        console.error('[聊天自动备份] (封装) 准备发送到 Worker 的数据时出错:', dataPrepError);
+        toastr.error(`备份失败：准备数据出错 - ${dataPrepError.message}`, '聊天自动备份');
+        return false;
+    }
+
+    // --- lastMessagePreview 的计算需要在这里进行，基于引用 ---
+    const lastMsgIndex = originalChatMessagesCount > 0 ? originalChatMessagesCount - 1 : -1;
+    const lastMessageObject = lastMsgIndex >= 0 && messagesRef.length > lastMsgIndex ? messagesRef[lastMsgIndex] : null;
+    const lastMessagePreview = lastMessageObject?.mes?.substring(0, 100) || (originalChatMessagesCount > 0 ? '(消息内容获取失败)' : '(空聊天)');
+
+
+    let copiedFullChatContentArray; // 这是 Worker 返回的结果 [metadata_clone, ...messages_clone]
+
+    try {
+        if (backupWorker) {
+            console.time('[聊天自动备份] Web Worker 处理时间 (postMessage + Worker内部构造)');
+            logDebug('(封装) 请求 Worker 处理数据 (传递引用)...');
+            // --- 步骤 2: 调用 Worker，传递【引用】 ---
+            copiedFullChatContentArray = await performDeepCopyInWorker(metadataRef, messagesRef);
+            console.timeEnd('[聊天自动备份] Web Worker 处理时间 (postMessage + Worker内部构造)');
+            logDebug('(封装) 从 Worker 收到处理后的 finalChatFileContent');
+        } else {
+            // --- Worker 不可用，主线程回退 ---
+            console.warn('[聊天自动备份] (封装) Worker 不可用，在主线程执行深拷贝和构造...');
+            console.time('[聊天自动备份] 主线程深拷贝和构造时间 (无Worker)');
+            const clonedMetadataMainThread = structuredClone(metadataRef);
+            const clonedMessagesMainThread = structuredClone(messagesRef);
+            copiedFullChatContentArray = [clonedMetadataMainThread, ...clonedMessagesMainThread];
+            console.timeEnd('[聊天自动备份] 主线程深拷贝和构造时间 (无Worker)');
         }
 
-        if (!copiedChat) {
-             throw new Error("未能获取有效的聊天数据副本");
+        if (!copiedFullChatContentArray || !Array.isArray(copiedFullChatContentArray) || copiedFullChatContentArray.length === 0) {
+             throw new Error("未能从 Worker 或主线程回退中获取有效的聊天数据副本");
         }
+        // originalChatMessagesCount 应该从 copiedFullChatContentArray[1...] 的长度再次确认，或者信任 Worker 的构造
+        // 但由于我们已在前面从 messagesRef 获取了 originalChatMessagesCount，这里可以沿用
 
-        // 3. 构建备份对象
+    } catch (processingError) { // 捕获 Worker 错误或主线程回退错误
+        console.error('[聊天自动备份] (封装) Worker 处理或主线程回退深拷贝时出错:', processingError);
+        toastr.error(`备份失败：数据处理错误 - ${processingError.message}`, '聊天自动备份');
+        return false;
+    }
+    
+    // --- 后续逻辑 (构建备份对象、保存、清理) 基于 copiedFullChatContentArray ---
+    try {
         const backup = {
             timestamp: currentTimestamp,
             chatKey,
             entityName,
             chatName,
-            lastMessageId: lastMsgIndex,
-            lastMessagePreview,
-            chat: copiedChat, // Standard chat data
-            metadata: copiedMetadata || {}, // Standard chat metadata (contains cellHistory, hashSheet, but missing data)
-            tablePluginExportData: tablePluginExportData // <<-- Include the generated import/export format data
+            lastMessageId: lastMsgIndex, // 使用之前基于引用的计算
+            lastMessagePreview,       // 使用之前基于引用的计算
+            chatFileContent: copiedFullChatContentArray,
         };
+        logDebug(`(封装) 构建的备份对象:`, {timestamp: backup.timestamp, chatKey: backup.chatKey, entityName: backup.entityName, chatName: backup.chatName, lastMessageId: backup.lastMessageId, preview: backup.lastMessagePreview, contentItems: backup.chatFileContent.length });
 
-        // 4. 检查当前聊天是否已有基于最后消息ID的备份 (避免完全相同的备份)
-        const existingBackups = await getBackupsForChat(chatKey); // 获取当前聊天的备份
-
-        // 5. 检查重复并处理 (基于 lastMessageId)
-        const existingBackupIndex = existingBackups.findIndex(b => b.lastMessageId === lastMsgIndex);
+        const existingBackups = await getBackupsForChat(chatKey);
+        const existingBackupIndex = existingBackups.findIndex(b => b.lastMessageId === lastMsgIndex && b.lastMessageId !== -1);
         let needsSave = true;
 
-        if (existingBackupIndex !== -1) {
-             // If found a backup with the same lastMessageId
+        if (lastMsgIndex !== -1 && existingBackupIndex !== -1) {
             const existingTimestamp = existingBackups[existingBackupIndex].timestamp;
             if (backup.timestamp > existingTimestamp) {
-                // New backup is more recent, delete the old one with the same ID
-                logDebug(`(封装) Found old backup with same last message ID (${lastMsgIndex}) (timestamp ${existingTimestamp}), will delete old backup to save new one (timestamp ${backup.timestamp})`);
                 await deleteBackup(chatKey, existingTimestamp);
-                // Note: No need to splice from existingBackups array as it's no longer used for global cleanup
             } else {
-                // Old backup is more recent or same, skip this save
-                logDebug(`(封装) Found backup with same last message ID (${lastMsgIndex}) and newer or same timestamp (timestamp ${existingTimestamp} vs ${backup.timestamp}), skipping this save`);
                 needsSave = false;
             }
         }
 
         if (!needsSave) {
-            logDebug('(封装) Backup already exists or no update needed (based on lastMessageId and timestamp comparison), skipping save and global cleanup steps');
-            return false; // No need to save, return false
+            logDebug('(封装) 无需保存 (已存在或无更新), 跳过保存和清理');
+            return false;
         }
 
-        // 6. Save the new backup to IndexedDB
         await saveBackupToDB(backup);
-        logDebug(`(封装) New backup saved: [${chatKey}, ${backup.timestamp}]`);
+        logDebug(`(封装) 新备份已保存: [${chatKey}, ${backup.timestamp}]`);
 
-        // --- Optimized cleanup logic ---
-        // 7. Get *keys* of all backups and limit total number
-        logDebug(`(封装) Getting keys of all backups to check against system limit (${settings.maxTotalBackups})`);
-        const allBackupKeys = await getAllBackupKeys(); // Call the new function to get only keys
-
+        const allBackupKeys = await getAllBackupKeys();
         if (allBackupKeys.length > settings.maxTotalBackups) {
-            logDebug(`(封装) Total number of backups (${allBackupKeys.length}) exceeds system limit (${settings.maxTotalBackups})`);
-
-            // Sort keys by timestamp in ascending order (key[1] is timestamp)
-            // This way, the keys of the oldest backups will be at the beginning of the array
-            allBackupKeys.sort((a, b) => a[1] - b[1]); // a[1] = timestamp, b[1] = timestamp
-
+            allBackupKeys.sort((a, b) => a[1] - b[1]);
             const numToDelete = allBackupKeys.length - settings.maxTotalBackups;
-            // Get the first numToDelete keys from the array, these are the keys of the oldest backups to delete
             const keysToDelete = allBackupKeys.slice(0, numToDelete);
-
-            logDebug(`(封装) Preparing to delete ${keysToDelete.length} oldest backups (based on keys)`);
-
-            // Use Promise.all to delete in parallel
-            await Promise.all(keysToDelete.map(key => {
-                const oldChatKey = key[0];
-                const oldTimestamp = key[1];
-                logDebug(`(封装) Deleting old backup (based on key): chatKey=${oldChatKey}, timestamp=${new Date(oldTimestamp).toLocaleString()}`);
-                // Call deleteBackup, which takes chatKey and timestamp
-                return deleteBackup(oldChatKey, oldTimestamp);
-            }));
-            logDebug(`(封装) ${keysToDelete.length} old backups deleted`);
-        } else {
-            logDebug(`(封装) Total number of backups (${allBackupKeys.length}) does not exceed limit (${settings.maxTotalBackups}), no cleanup needed`);
+            await Promise.all(keysToDelete.map(key => deleteBackup(key[0], key[1])));
+            logDebug(`(封装) ${keysToDelete.length} 个旧备份已删除`);
         }
-        // --- Cleanup logic ends ---
 
-        // 8. UI notification
-        logDebug(`(封装) Chat backup and potential cleanup successful: ${entityName} - ${chatName}`);
+        logDebug(`(封装) 聊天备份和潜在清理成功: ${entityName} - ${chatName}`);
+        return true;
 
-        return true; // Indicates backup was successful (or skipped without error)
-
-    } catch (error) {
-        console.error('[聊天自动备份] (封装) Serious error occurred during backup or cleanup:', error);
-        throw error; // Re-throw the error for the external caller to handle toastr
+    } catch (saveError) {
+        console.error('[聊天自动备份] (封装) 保存备份或清理过程中发生严重错误:', saveError);
+        toastr.error(`备份失败：保存或清理错误 - ${saveError.message}`, '聊天自动备份');
+        throw saveError; // 重新抛出，让 performBackupConditional 捕获
     }
 }
 
 
-// --- Conditional backup function (similar to saveChatConditional) ---
+// --- Conditional backup function ---
 async function performBackupConditional() {
+    // 首先尝试保存当前聊天状态，确保获取的数据是最新的
+    try {
+        logDebug('尝试在备份前执行 saveChatConditional()');
+        await saveChatConditional(); // <--- 新增：确保聊天数据已保存
+        logDebug('saveChatConditional() 执行完毕');
+    } catch (error) {
+        console.error('[聊天自动备份] saveChatConditional 执行失败:', error);
+        // 继续备份过程，但记录错误
+    }
+
     if (isBackupInProgress) {
         logDebug('Backup is already in progress, skipping this request');
         return;
@@ -654,15 +591,11 @@ async function performBackupConditional() {
     clearTimeout(backupTimeout); // Cancel any pending debounced backups
     backupTimeout = null;
 
-    // 插件应该专注于从当前系统状态获取数据并创建备份，而不应该尝试控制或依赖SillyTavern的保存机制。
-    // 因此，我们不再尝试调用saveChatConditional()，而是直接从当前上下文获取数据。
-
-    const context = getContext();
+    const context = getContext(); // 现在 getContext() 会获取到更可靠的数据
     const chatKey = getCurrentChatKey();
 
     if (!chatKey) {
-        logDebug('Could not get a valid chat identifier (after saveChatConditional), cancelling backup');
-        // Log Cancellation Details using correct property names for checking
+        logDebug('Could not get a valid chat identifier, cancelling backup');
         console.warn('[聊天自动备份] Cancellation Details (No ChatKey):', {
              contextDefined: !!context,
              chatMetadataDefined: !!context?.chatMetadata,
@@ -675,35 +608,21 @@ async function performBackupConditional() {
          });
         return false;
     }
-    // Check if chatMetadata exists and chatMetadata.sheets exists and is not empty
-    // We are now backing up table data using a different method, so this check is less critical for table data itself,
-    // but still indicates if the core chat metadata is missing. Let's keep it as a general sanity check.
+    
     if (!context.chatMetadata) {
-        console.warn('[聊天自动备份] chatMetadata is invalid (after saveChatConditional), cancelling backup');
+        console.warn('[聊天自动备份] chatMetadata is invalid, cancelling backup');
         console.warn('[聊天自动备份] Cancellation Details (chatMetadata Invalid):', {
              contextDefined: !!context, chatMetadataDefined: !!context?.chatMetadata
          });
         return false;
-    }
-     // We don't strictly need sheets to be valid in metadata anymore for table backup,
-     // as we generate export data from Sheet instances. But let's keep the warning.
-     if (!context.chatMetadata.sheets || context.chatMetadata.sheets.length === 0) {
-         console.warn('[聊天自动备份] chatMetadata.sheets is invalid or empty (after saveChatConditional). Table data backup might still work if Sheet instances are available.');
      }
-
 
     isBackupInProgress = true;
     logDebug('Setting backup lock');
     try {
-        // Get the current chat and chatMetadata from the context
-        const { chat } = context;
-        const chat_metadata_to_backup = context.chatMetadata; // This is the standard chatMetadata
-
-        // Execute the core backup logic
-        // Execute the core backup logic
-        const success = await executeBackupLogic_Core(chat, chat_metadata_to_backup, currentSettings);
+        // executeBackupLogic_Core 内部的 getContext() 也会受益于之前的 saveChatConditional()
+        const success = await executeBackupLogic_Core(currentSettings);
         if (success) {
-            // Only update the list if a new backup was actually saved
             await updateBackupsList();
         }
         return success;
@@ -768,259 +687,218 @@ async function performManualBackup() {
     console.log('[聊天自动备份] Performing manual backup (calling conditional function)');
     try {
          await performBackupConditional(); // Manual backup also goes through conditional check and lock logic
-         toastr.success('当前聊天备份已完成！', '聊天自动备份');
+         toastr.success('Manual backup of current chat completed', 'Chat Auto Backup');
     } catch (error) {
          // The conditional function already shows an error toast, but log here too.
          console.error('[聊天自动备份] Manual backup failed:', error);
     }
 }
 
-// --- 恢复逻辑（优化版）---
+
+// --- Restore logic ---
 async function restoreBackup(backupData) {
-    // --- 入口和基本信息提取 ---
-    console.log('[聊天自动备份] 开始备份恢复（优化流程）:', { chatKey: backupData.chatKey, timestamp: backupData.timestamp });
-    logDebug('[聊天自动备份] 原始备份数据（backup）:', JSON.parse(JSON.stringify(backupData)));
+    logDebug('[聊天自动备份] 开始恢复备份:', { chatKey: backupData.chatKey, timestamp: backupData.timestamp });
+    logDebug('[聊天自动备份] 备份数据从本地获取，无需API请求获取数据');
 
-    const isGroup = backupData.chatKey.startsWith('group_');
-    const entityIdMatch = backupData.chatKey.match(
-        isGroup
-        ? /group_(\w+)_/ // 匹配群组ID
-        : /^char_(\d+)/  // 匹配角色ID（索引）
-    );
-    let entityId = entityIdMatch ? entityIdMatch[1] : null;
-
-    if (!entityId) {
-        console.error('[聊天自动备份] 无法从备份数据中提取角色/群组ID:', backupData.chatKey);
-        toastr.error('无法识别备份的角色/群组ID');
+    // 验证备份数据完整性
+    if (!backupData.chatFileContent || !Array.isArray(backupData.chatFileContent) || backupData.chatFileContent.length === 0) {
+        toastr.error('备份数据无效：缺少或空的 chatFileContent。', '恢复失败');
+        console.error('[聊天自动备份] 备份数据无效，无法恢复。');
         return false;
     }
 
-    const entityToRestore = {
-        isGroup: isGroup,
-        id: entityId,
-        charIndex: -1, // 初始化
-        // 从备份中存储原始聊天名称，以便在selectCharacterById/select_group_chats中可能需要使用
-        // 目前，newChatId将作为文件的主要标识符
-    };
+    // 从 backupData 中获取 entityName 和 chatName
+    const originalEntityName = backupData.entityName || '未知实体';
+    const originalChatName = backupData.chatName || '未知聊天';
 
-    if (!isGroup) {
-        entityToRestore.charIndex = parseInt(entityId, 10);
-        if (isNaN(entityToRestore.charIndex) || entityToRestore.charIndex < 0 || entityToRestore.charIndex >= characters.length) {
-             console.error(`[聊天自动备份] 无效的角色索引: ${entityId}`);
-             toastr.error(`找不到对应角色卡 ${entityId}`);
-             return false;
-        }
+    // 提取原始实体ID
+    const isGroupBackup = backupData.chatKey.startsWith('group_');
+    let originalEntityId = null;
+    
+    if (isGroupBackup) {
+        // 从 group_GROUPID_chatid 格式中提取 GROUPID
+        const match = backupData.chatKey.match(/^group_([^_]+)_/);
+        originalEntityId = match ? match[1] : null;
+        logDebug(`[聊天自动备份] 从备份 chatKey 中提取的原始群组ID: ${originalEntityId}`);
+    } else {
+        // 从 char_CHARINDEX_chatid 格式中提取 CHARINDEX
+        const match = backupData.chatKey.match(/^char_(\d+)_/);
+        originalEntityId = match ? match[1] : null;
+        logDebug(`[聊天自动备份] 从备份 chatKey 中提取的原始角色索引: ${originalEntityId}`);
     }
 
-    logDebug(`恢复目标: ${isGroup ? '群组' : '角色'} ID/标识符: ${entityToRestore.id}`);
+    if (!originalEntityId) {
+        toastr.error('无法从备份数据中解析原始实体ID。', '恢复失败');
+        console.error('[聊天自动备份] 无法解析原始实体ID，chatKey:', backupData.chatKey);
+        return false;
+    }
+
+    // 从 chatFileContent 中分离元数据和消息
+    const retrievedChatMetadata = structuredClone(backupData.chatFileContent[0]);
+    const retrievedChat = structuredClone(backupData.chatFileContent.slice(1));
+
+    if (typeof retrievedChatMetadata !== 'object' || !Array.isArray(retrievedChat)) {
+        toastr.error('备份数据格式错误：无法分离元数据和消息。', '恢复失败');
+        console.error('[聊天自动备份] 备份数据 chatFileContent 格式错误。');
+        return false;
+    }
+    logDebug(`[聊天自动备份] 从备份中提取元数据 (keys: ${Object.keys(retrievedChatMetadata).length}) 和消息 (count: ${retrievedChat.length})`);
+
+    // 注意: 移除多余的确认对话框，因为确认已在外部UI事件处理中完成
+
+    // --- 2. 构建 .jsonl File 对象 ---
+    logDebug('[聊天自动备份] 步骤2: 构建 .jsonl File 对象...');
+    const jsonlString = constructJsonlString(retrievedChatMetadata, retrievedChat);
+    if (!jsonlString) {
+        toastr.error('无法构建 .jsonl 数据，恢复中止。', '恢复失败');
+        return false;
+    }
+
+    const timestampSuffix = new Date(backupData.timestamp).toISOString().replace(/[:.]/g, '-');
+    // 使用原始聊天名和备份时间戳来命名恢复的文件，增加可识别性
+    const restoredInternalFilename = `${originalChatName}_restored_${timestampSuffix}.jsonl`;
+    const chatFileObject = new File([jsonlString], restoredInternalFilename, { type: "application/json-lines" });
+    logDebug(`[聊天自动备份] 已创建 File 对象: ${chatFileObject.name}, 大小: ${chatFileObject.size} bytes`);
+
+    // --- 3. 获取当前上下文以确定导入目标 ---
+    const currentContext = getContext();
+    const formData = new FormData();
+    formData.append('file', chatFileObject);
+    formData.append('file_type', 'jsonl');
+
+    let importUrl = '';
+    let success = false;
+
+    logDebug('[聊天自动备份] 步骤3: 准备调用导入API...');
 
     try {
-        toastr.info(`正在恢复备份，插件将自动接管酒馆界面，尝试聊天记录、记忆表格、作者注释...请耐心等候消息结果！`);
-        // --- 步骤1: 切换上下文（如需要）---
-        const initialContext = getContext();
-        logDebug('[聊天自动备份] 步骤1 - 上下文切换前的上下文:', {
-            groupId: initialContext.groupId,
-            characterId: initialContext.characterId,
-            chatId: initialContext.chatId
-        });
-        const needsContextSwitch = (isGroup && initialContext.groupId !== entityToRestore.id) ||
-                                   (!isGroup && String(initialContext.characterId) !== String(entityToRestore.charIndex)); // 比较charIndex
-
-        if (needsContextSwitch) {
-            try {
-                logDebug('步骤1: 需要切换上下文，开始切换...');
-                if (isGroup) {
-                    await select_group_chats(entityToRestore.id);
-                } else {
-                    await selectCharacterById(entityToRestore.charIndex, { switchMenu: false });
-                }
-                // 短暂延迟，让上下文切换完全传播并触发事件
-                await new Promise(resolve => setTimeout(resolve, 200)); // 200毫秒，可调整
-                logDebug('[聊天自动备份] 步骤1: 上下文切换可能已完成。当前上下文:', {
-                    groupId: getContext().groupId, characterId: getContext().characterId, chatId: getContext().chatId
-                });
-            } catch (switchError) {
-                console.error('[聊天自动备份] 步骤1失败: 切换角色/群组失败:', switchError);
-                toastr.error(`切换对应角色卡/群组失败: ${switchError.message || switchError}`);
-                return false;
-            }
-        } else {
-            logDebug('步骤1: 已在目标上下文中，跳过切换');
-        }
-
-        // --- 步骤2: 创建新聊天 ---
-        let originalChatIdBeforeNewChat = getContext().chatId; // 在可能的上下文切换*后*获取聊天ID
-        logDebug('步骤2: 开始创建新聊天...');
-        await doNewChat({ deleteCurrentChat: false });
-        // 短暂延迟，让新聊天创建事件处理
-        await new Promise(resolve => setTimeout(resolve, 200)); // 200毫秒，可调整
-        logDebug('[聊天自动备份] 步骤2: 新聊天创建可能已完成。');
-
-
-        // --- 步骤3: 获取新聊天ID ---
-        logDebug('步骤3: 获取新聊天ID...');
-        let contextAfterNewChat = getContext();
-        const newChatId = contextAfterNewChat.chatId;
-
-        if (!newChatId || newChatId === originalChatIdBeforeNewChat) {
-            console.error('[聊天自动备份] 步骤3失败: 无法获取有效的新chatId。新ChatID:', newChatId, "旧ChatID（创建新聊天前）:", originalChatIdBeforeNewChat);
-            toastr.error('无法获取新聊天的ID，无法继续恢复');
+        if (isGroupBackup) { // 恢复到原始群组
+            const targetGroupId = originalEntityId; // 使用从备份中提取的原始群组ID
+            const targetGroup = context.groups?.find(g => g.id === targetGroupId);
+            
+            if (!targetGroup) {
+                toastr.error(`原始群组 (ID: ${targetGroupId}) 不存在，无法恢复。请确保该群组已经被加载或创建。`, '恢复失败');
+                logDebug(`[聊天自动备份] 找不到原始群组 ${targetGroupId}，恢复失败。可用的群组IDs: ${context.groups?.map(g => g.id).join(', ') || '无'}`);
             return false;
         }
-        logDebug(`步骤3: 成功获取新聊天ID: ${newChatId}`);
+            
+            logDebug(`[聊天自动备份] 准备将备份导入到原始群组: ${targetGroup.name} (ID: ${targetGroupId})`);
 
-        // --- 步骤4: 准备聊天内容和元数据以保存 ---
-        logDebug('步骤4: 在内存中准备聊天内容和元数据...');
-        const chatToSave = structuredClone(backupData.chat);
-        let metadataToSave = structuredClone(backupData.metadata || {});
-        console.log('[聊天自动备份] 步骤4 - 要保存的聊天消息（前2条）:', chatToSave.slice(0, Math.min(chatToSave.length, 2)));
-        console.log('[聊天自动备份] 步骤4 - 要保存的元数据（来自备份的初始数据）:', JSON.parse(JSON.stringify(metadataToSave)));
+            importUrl = '/api/chats/group/import';
+            formData.append('group_id', targetGroupId); // 使用原始群组ID
 
-        // 确保如果存在tablePluginExportData，则metadataToSave.sheets存在，
-        // 因为TablePluginBASE.applyJsonToChatSheets可能依赖于基本结构。
-        if (backupData.tablePluginExportData && (!metadataToSave.sheets || !Array.isArray(metadataToSave.sheets))) {
-            metadataToSave.sheets = []; // 如果不存在或不是数组，则初始化为空数组
-            logDebug('[聊天自动备份] 步骤4: 由于tablePluginExportData存在，已将metadataToSave.sheets初始化为空数组。');
-        }
-        if (metadataToSave.sheets) {
-            logDebug('[聊天自动备份] 步骤4 - 保存前的最终metadataToSave.sheets:', JSON.parse(JSON.stringify(metadataToSave.sheets)));
-        }
+            const response = await fetch(importUrl, {
+                method: 'POST',
+                headers: getRequestHeaders(),
+                body: formData,
+            });
 
-
-        // --- 步骤5: 将恢复的数据保存到新聊天文件 ---
-        logDebug(`步骤5: 临时替换全局聊天和chatMetadata以保存到新聊天文件: ${newChatId}`);
-        let globalContext = getContext(); // 修改前再次getContext()
-        let originalGlobalChat = globalContext.chat.slice();
-        let originalGlobalMetadata = structuredClone(globalContext.chatMetadata);
-        logDebug('[聊天自动备份] 步骤5 - 临时替换前的全局chatMetadata:', JSON.parse(JSON.stringify(originalGlobalMetadata)));
-
-        // 用恢复的数据替换全局聊天和chatMetadata
-        globalContext.chat.length = 0;
-        chatToSave.forEach(msg => globalContext.chat.push(msg));
-        globalContext.chatMetadata = metadataToSave; // 直接分配准备好的元数据
-        logDebug('[聊天自动备份] 步骤5 - 全局chatMetadata临时替换为恢复的元数据:', JSON.parse(JSON.stringify(globalContext.chatMetadata)));
-
-        try {
-            logDebug(`步骤5: 调用saveChat({ chatName: "${newChatId}", force: true })保存恢复的数据...`);
-            await saveChat({ chatName: newChatId, force: true }); // 保存到特定的新聊天ID
-            logDebug('步骤5: saveChat调用成功完成。');
-            // 短暂延迟，让文件系统操作稳定
-            await new Promise(resolve => setTimeout(resolve, 200)); // 200毫秒
-        } catch (saveError) {
-            console.error("[聊天自动备份] 步骤5失败: saveChat调用期间出错:", saveError);
-            toastr.error(`保存恢复的新聊天失败: ${saveError.message}`, '聊天自动备份');
-            return false; // 严重失败
-        } finally {
-             // 恢复全局状态（关键）
-             globalContext.chat.length = 0;
-             originalGlobalChat.forEach(msg => globalContext.chat.push(msg));
-             globalContext.chatMetadata = originalGlobalMetadata;
-             logDebug('步骤5: 全局聊天和chatMetadata已恢复到保存前的状态。');
-        }
-
-        // --- 步骤6: 显式重新加载新保存的聊天并应用的表格数据 ---
-        console.log('[聊天自动备份] 步骤6: 重新加载新聊天并应用表格数据...');
-
-        // 6a: 触发SillyTavern重新加载/选择此特定新聊天文件。
-        // 这将触发CHAT_CHANGED，其他插件（如表格插件）将做出反应。
-        // 表格插件应该根据文件中的chatMetadata.sheets初始化其基本Sheet实例。
-        logDebug(`[聊天自动备份] 步骤6a: 显式选择/重新加载带有新聊天ID的目标实体: "${newChatId}"`);
-        try {
-            if (entityToRestore.isGroup) {
-                // 对于群组，openGroupChat处理设置活动chat_id并加载它。
-                await openGroupChat(entityToRestore.id, newChatId);
-            } else {
-                // 对于角色，带有chatFile选项的selectCharacterById是首选。
-                // 或者如果只有文件名可用，则使用openCharacterChat（这里newChatId是文件名）
-                await selectCharacterById(entityToRestore.charIndex, { switchMenu: false, chatFile: newChatId });
-                // 替代方案: await openCharacterChat(newChatId);
+            if (!response.ok) {
+                const errorData = await response.json().catch(() => ({ error: '未知API错误' }));
+                throw new Error(`群组聊天导入API失败: ${response.status} - ${errorData.error}`);
             }
-            logDebug(`[聊天自动备份] 步骤6a: 已发送重新加载/选择聊天"${newChatId}"的命令。`);
-        } catch (reloadError) {
-            console.error(`[聊天自动备份] 步骤6a失败: 显式重新加载/选择聊天"${newChatId}"时出错:`, reloadError);
-            toastr.error(`重新加载新聊天失败: ${reloadError.message || reloadError}。记忆表格数据可能无法恢复。`, '聊天自动备份');
-            // 尝试继续，SillyTavern可能仍然会渲染聊天消息。
-        }
+            
+            const importResult = await response.json();
+            logDebug(`[聊天自动备份] 群组聊天导入API响应:`, importResult);
 
-        // 6b: CHAT_CHANGED事件传播和表格插件执行初始设置的短暂延迟
-        // 这允许表格插件处理从文件加载的chatMetadata.sheets。
-        console.log('[聊天自动备份] 步骤6b: 等待CHAT_CHANGED传播和表格插件基本初始化...');
-        await new Promise(resolve => setTimeout(resolve, 300)); // 300毫秒，可调整。
+            if (importResult.res) { // importResult.res 是新创建的聊天ID
+                const newGroupChatId = importResult.res;
+                logDebug(`[聊天自动备份] 群组聊天导入成功，新聊天ID: ${newGroupChatId}。`);
 
-        // 6c: 验证上下文并记录文件加载后的sheets状态
-        const loadedContextAfterReload = getContext();
-        if (loadedContextAfterReload.chatId !== newChatId) {
-            console.warn(`[聊天自动备份] 步骤6c警告: 重新加载后，当前chatId (${loadedContextAfterReload.chatId})与预期的newChatId (${newChatId})不匹配。这可能表明存在问题。`);
-            // 不一定在这里失败，但要记录下来。如果上下文基本正确，表格恢复可能仍然有效。
-        } else {
-            logDebug(`[聊天自动备份] 步骤6c: 聊天"${newChatId}"似乎已加载。当前context.chatId: ${loadedContextAfterReload.chatId}`);
-        }
-        if (loadedContextAfterReload.chatMetadata && loadedContextAfterReload.chatMetadata.sheets) {
-            logDebug('[聊天自动备份] 步骤6c - 从文件加载的chatMetadata.sheets:', JSON.parse(JSON.stringify(loadedContextAfterReload.chatMetadata.sheets)));
-        } else {
-            logDebug('[聊天自动备份] 步骤6c - 文件加载后未找到chatMetadata.sheets或为空。');
-        }
-
-        // 6d: 使用tablePluginExportData通过表格插件的API应用详细的表格数据
-        // 这应该在表格插件有机会根据文件的sheet结构初始化后发生。
-        toastr.info('正在尝试恢复记忆表格并渲染（如果有的话）');
-        if (backupData.tablePluginExportData) {
-            logDebug('[聊天自动备份] 步骤6d: 尝试使用tablePluginExportData通过API恢复表格数据...');
-            console.log('[聊天自动备份] 步骤6d: 通过API导入的数据:', JSON.parse(JSON.stringify(backupData.tablePluginExportData)));
-            try {
-                if (TablePluginBASE && typeof TablePluginBASE.applyJsonToChatSheets === 'function') {
-                    // "both"将尝试更新现有定义并导入数据。
-                    await TablePluginBASE.applyJsonToChatSheets(backupData.tablePluginExportData, "both");
-                    logDebug('[聊天自动备份] 步骤6d: TablePluginBASE.applyJsonToChatSheets调用成功完成。');
-                    toastr.info('已通过记忆表格插件API尝试表格数据恢复。', '聊天自动备份', {timeOut: 3000});
+                // --- 新增：检查当前上下文是否需要切换到目标群组 ---
+                const currentContextBeforeOpenGroup = getContext();
+                if (String(currentContextBeforeOpenGroup.groupId) !== String(targetGroupId)) {
+                    logDebug(`[聊天自动备份] 当前群组 (ID: ${currentContextBeforeOpenGroup.groupId}) 与目标恢复群组 (ID: ${targetGroupId}) 不同，select_group_chats 将处理切换...`);
+                    // 在这种情况下 select_group_chats 将同时处理群组切换和聊天加载
                 } else {
-                    console.warn('[聊天自动备份] 步骤6d: TablePluginBASE.applyJsonToChatSheets方法不可用。');
-                    toastr.warning('记忆表格插件API不可用，无法自动恢复详细的表格数据。', '聊天自动备份', {timeOut: 5000});
+                    logDebug(`[聊天自动备份] 当前已在目标恢复群组 (ID: ${targetGroupId}) 上下文中，只需加载新聊天。`);
+                    // 即使在同一群组中，select_group_chats 也应该正确处理只切换聊天而不重新加载整个群组的情况
                 }
-            } catch (importError) {
-                console.error('[聊天自动备份] 步骤6d: TablePluginBASE.applyJsonToChatSheets调用期间出错:', importError);
-                toastr.error('通过记忆表格API恢复详细表格数据时出错。请检查控制台。', '聊天自动备份', {timeOut: 5000});
-            }
-        } else {
-            console.warn('[聊天自动备份] 步骤6d: 在备份中未找到tablePluginExportData。跳过基于API的表格恢复。');
-        }
+                // --- 检查逻辑结束 ---
 
-        // 6e: 刷新表格插件的UI以显示恢复的数据
-        // 这对于用户查看表格数据恢复结果至关重要。
-        logDebug('[聊天自动备份] 步骤6e: 刷新表格插件UI...');
-        if (typeof tablePlugin_refreshContextView === 'function') {
-            try {
-                await tablePlugin_refreshContextView();
-                logDebug('[聊天自动备份] 步骤6e: tablePlugin_refreshContextView调用完成。');
-            } catch (refreshError) {
-                 console.error('[聊天自动备份] 步骤6e: 调用tablePlugin_refreshContextView时出错:', refreshError);
-            }
+                logDebug(`[聊天自动备份] 正在加载新导入的群组聊天: ${newGroupChatId} 到群组 ${targetGroupId}...`);
+                await select_group_chats(targetGroupId, newGroupChatId); // 加载新导入的聊天
+                
+                toastr.success(`备份已作为新聊天 "${newGroupChatId}" 导入到群组 "${targetGroup.name}"！`);
+                success = true;
         } else {
-            const tableDrawerButton = document.getElementById('table_drawer_icon');
-            if (tableDrawerButton) {
-                 logDebug('[聊天自动备份] 步骤6e: 模拟点击#table_drawer_icon作为备用刷新方法...');
-                 tableDrawerButton.click(); // 打开
-                 // setTimeout(() => tableDrawerButton.click(), 200); // 可选地再次点击以关闭（如果它之前是关闭的）
+                throw new Error('群组聊天导入API未返回有效的聊天ID。');
+            }
+        } else if (!isGroupBackup) { // 恢复到原始角色
+            const targetCharacterIndex = parseInt(originalEntityId, 10);
+            
+            if (isNaN(targetCharacterIndex) || targetCharacterIndex < 0 || targetCharacterIndex >= characters.length) {
+                toastr.error(`备份中的原始角色索引 (${originalEntityId}) 无效或超出范围。`, '恢复失败');
+                logDebug(`[聊天自动备份] 原始角色索引 ${originalEntityId} 无效，characters数组长度: ${characters.length}`);
+                return false;
+            }
+            
+            const targetCharacter = characters[targetCharacterIndex];
+            if (!targetCharacter) {
+                toastr.error(`无法找到备份对应的原始角色 (索引: ${targetCharacterIndex})。`, '恢复失败');
+                return false;
+            }
+            
+            logDebug(`[聊天自动备份] 准备将备份内容作为新聊天保存到原始角色: ${targetCharacter.name} (索引: ${targetCharacterIndex})`);
+
+            // 对于角色，使用 /api/chats/save 来创建一个新的聊天文件
+            const newChatIdForRole = chatFileObject.name.replace('.jsonl', '');
+            const chatToSaveForRole = [retrievedChatMetadata, ...retrievedChat];
+
+            const saveResponse = await fetch('/api/chats/save', {
+                method: 'POST',
+                headers: getRequestHeaders(),
+                body: JSON.stringify({
+                    ch_name: targetCharacter.name,
+                    file_name: newChatIdForRole,
+                    chat: chatToSaveForRole,
+                    avatar_url: targetCharacter.avatar,
+                    force: false // 保留false，避免意外覆盖，如有冲突将报错
+                }),
+            });
+            
+            if (!saveResponse.ok) {
+                const errorText = await saveResponse.text();
+                throw new Error(`保存角色聊天API失败: ${saveResponse.status} - ${errorText}`);
+            }
+            
+            logDebug(`[聊天自动备份] 角色聊天内容已通过 /api/chats/save 保存为: ${newChatIdForRole}.jsonl`);
+
+            // --- 新增：检查当前上下文是否需要切换到目标角色 ---
+            const currentContextBeforeOpen = getContext();
+            if (String(currentContextBeforeOpen.characterId) !== String(targetCharacterIndex)) {
+                logDebug(`[聊天自动备份] 当前角色 (ID: ${currentContextBeforeOpen.characterId}) 与目标恢复角色 (索引: ${targetCharacterIndex}) 不同，执行切换...`);
+                await selectCharacterById(targetCharacterIndex);
+                // 在切换角色后，添加短暂延迟以确保SillyTavern的上下文和UI稳定
+                await new Promise(resolve => setTimeout(resolve, 300)); 
+                logDebug(`[聊天自动备份] 已切换到目标角色 (索引: ${targetCharacterIndex})`);
             } else {
-                 console.warn('[聊天自动备份] 步骤6e: tablePlugin_refreshContextView和#table_drawer_icon都不可用于UI刷新。');
+                logDebug(`[聊天自动备份] 当前已在目标恢复角色 (索引: ${targetCharacterIndex}) 上下文中，无需切换角色。`);
+            }
+            // --- 检查和切换逻辑结束 ---
+
+            // 打开新保存的聊天文件 (此时应该已经在正确的角色上下文中了)
+            await openCharacterChat(newChatIdForRole);
+            
+            toastr.success(`备份已作为新聊天 "${newChatIdForRole}" 恢复到角色 "${targetCharacter.name}"！`);
+            success = true;
+                    } else {
+            toastr.error('未选择任何角色或群组，无法确定恢复目标。', '恢复失败');
+            return false;
+        }
+
+        if (success) {
+            logDebug('[聊天自动备份] 恢复流程成功完成。');
+            // 刷新备份列表
+            if (typeof updateBackupsList === 'function') {
+                 await updateBackupsList(); 
             }
         }
-        toastr.success('已完成记忆表格恢复与渲染流程（如果聊天有记忆表格的话）', '聊天自动备份');
+        return success;
 
-        // --- 步骤7: 完成 ---
-        // SillyTavern将处理渲染主聊天消息（printMessages, scrollChatToBottom）
-        // 作为selectCharacterById/openGroupChat过程的一部分。
-        // 非常短的延迟可以确保DOM操作有机会完成，以获得视觉上的流畅性。
-        await new Promise(resolve => setTimeout(resolve, 200)); // 200毫秒，用于视觉稳定
-
-        console.log('[聊天自动备份] 恢复过程完成（优化流程）');
-        toastr.success('聊天记录已成功恢复。', '聊天自动备份');
-        return true;
-
-    } catch (error) {
-        console.error('[聊天自动备份] 聊天恢复过程中发生意外严重错误:', error);
-        toastr.error(`恢复失败: ${error.message || '未知错误'}`, '聊天自动备份');
-        // 考虑是否需要在此处进行任何清理或状态重置，尽管各个步骤都有finally块。
+        } catch (error) {
+        console.error(`[聊天自动备份] 通过导入API恢复备份时发生严重错误:`, error);
+        toastr.error(`恢复备份失败: ${error.message}`, '恢复失败');
         return false;
     }
 }
@@ -1119,16 +997,18 @@ jQuery(async () => {
             // 设置 Worker 消息处理器 (主线程)
             backupWorker.onmessage = function(e) {
                 const { id, result, error } = e.data;
-                if (workerPromises[id]) {
+                const promise = workerPromises[id];
+                
+                if (promise) {
                     if (error) {
                         console.error(`[主线程] Worker 返回错误 (ID: ${id}):`, error);
-                        workerPromises[id].reject(new Error(error));
+                        promise.reject(new Error(error));
                     } else {
-                        workerPromises[id].resolve(result);
+                        promise.resolve(result);
                     }
-                    delete workerPromises[id]; // 清理 Promise 记录
+                    delete workerPromises[id];
                 } else {
-                     console.warn(`[主线程] 收到未知或已处理的 Worker 消息 (ID: ${id})`);
+                    console.warn(`[主线程] 收到未知或已处理的 Worker 消息 (ID: ${id})`);
                 }
             };
 
@@ -1307,9 +1187,8 @@ jQuery(async () => {
             const timestamp = parseInt(button.data('timestamp'));
             const chatKey = button.data('key');
             logDebug(`点击预览按钮, timestamp: ${timestamp}, chatKey: ${chatKey}`);
-
             button.prop('disabled', true).text('加载中...'); // 禁用按钮并显示状态
-
+            
             try {
                 const db = await getDB();
                 const backup = await new Promise((resolve, reject) => {
@@ -1331,114 +1210,114 @@ jQuery(async () => {
                     };
                 });
 
-                if (backup && backup.chat && backup.chat.length > 0) {
-                    // 获取最后两条消息
-                    const chat = backup.chat;
-                    const lastMessages = chat.slice(-2);
+                if (backup && backup.chatFileContent && Array.isArray(backup.chatFileContent) && backup.chatFileContent.length > 1) {
+                    logDebug('[聊天自动备份] 直接使用已保存的备份数据展示预览，无需API请求');
+                    // 提取消息 (跳过索引0的元数据)
+                    const messages = backup.chatFileContent.slice(1);
                     
-                    // 过滤标签并处理Markdown
-                    const processMessage = (messageText) => {
-                        if (!messageText) return '(空消息)';
+                    if (messages.length > 0) {
+                        // 获取最后两条消息
+                        const lastMessages = messages.slice(-2);
                         
-                        // 过滤<think>和<thinking>标签及其内容
-                        let processed = messageText
-                            .replace(/<think>[\s\S]*?<\/think>/g, '')
-                            .replace(/<thinking>[\s\S]*?<\/thinking>/g, '');
+                        // 过滤标签并处理Markdown
+                        const processMessage = (messageText) => {
+                            // 确保 messageText 是字符串类型
+                            if (typeof messageText !== 'string') {
+                                if (messageText === null || messageText === undefined) {
+                                    return '(空消息)';
+                                }
+                                
+                                // 如果 messageText 是对象，尝试从中提取 mes 属性
+                                if (typeof messageText === 'object' && messageText !== null) {
+                                    if (typeof messageText.mes === 'string') {
+                                        messageText = messageText.mes;
+                                    } else {
+                                        console.warn(`[聊天自动备份] processMessage 收到非字符串类型的消息:`, messageText);
+                                        messageText = String(messageText); // 尝试转换为字符串
+                                    }
+                                } else {
+                                    // 其他非字符串类型
+                                    console.warn(`[聊天自动备份] processMessage 收到非字符串类型的消息:`, messageText);
+                                    messageText = String(messageText); // 尝试转换为字符串
+                                }
+                            }
+                            
+                            if (!messageText) return '(空消息)';
+                            
+                            // 过滤<think>和<thinking>标签及其内容
+                            let processed = messageText
+                                .replace(/<think>[\s\S]*?<\/think>/g, '')
+                                .replace(/<thinking>[\s\S]*?<\/thinking>/g, '');
+                            
+                            // 过滤代码块和白毛控名称
+                            processed = processed
+                                .replace(/```[\s\S]*?```/g, '')    // 移除代码块
+                                .replace(/`[\s\S]*?`/g, '');       // 移除内联代码
+                            
+                            // 简单的Markdown处理，保留部分格式
+                            processed = processed
+                                .replace(/\*\*(.*?)\*\*/g, '<strong>$1</strong>')  // 粗体
+                                .replace(/\*(.*?)\*/g, '<em>$1</em>')              // 斜体
+                                .replace(/\n\n+/g, '\n')                           // 多个连续换行替换为单个
+                                .replace(/\n/g, '<br>');                           // 换行
+                            
+                            return processed;
+                        };
                         
-                        // 过滤代码块和白毛控名称
-                        processed = processed
-                            .replace(/```[\s\S]*?```/g, '')    // 移除代码块
-                            .replace(/`[\s\S]*?`/g, '');       // 移除内联代码
+                        // 创建样式
+                        const style = document.createElement('style');
+                        style.textContent = `
+                            .message_box {
+                                padding: 10px;
+                                margin-bottom: 10px;
+                                border-radius: 8px;
+                                max-width: 80%;
+                            }
+                            .user_message {
+                                background-color: #e1f5fe;
+                                margin-left: auto;
+                            }
+                            .assistant_message {
+                                background-color: #f5f5f5;
+                                margin-right: auto;
+                            }
+                            .preview_container {
+                                display: flex;
+                                flex-direction: column;
+                                padding: 10px;
+                                max-height: 400px;
+                                overflow-y: auto;
+                            }
+                        `;
+                        document.head.appendChild(style);
                         
-                        // 简单的Markdown处理，保留部分格式
-                        processed = processed
-                            .replace(/\*\*(.*?)\*\*/g, '<strong>$1</strong>')  // 粗体
-                            .replace(/\*(.*?)\*/g, '<em>$1</em>')              // 斜体
-                            .replace(/\n\n+/g, '\n')                         // 多个连续换行替换为两个
-                            .replace(/\n/g, '<br>');                           // 换行
+                        // 创建预览容器
+                        const previewContainer = document.createElement('div');
+                        previewContainer.className = 'preview_container';
                         
-                        return processed;
-                    };
-                    
-                    // 创建样式
-                    const style = document.createElement('style');
-                    style.textContent = `
-                        .message_box {
-                            padding: 10px;
-                            margin-bottom: 10px;
-                            border-radius: 8px;
-                            background: rgba(0, 0, 0, 0.15);
-                        }
-                        .message_sender {
-                            font-weight: bold;
-                            margin-bottom: 5px;
-                            color: var(--SmColor);
-                        }
-                        .message_content {
-                            white-space: pre-wrap;
-                            line-height: 1.4;
-                        }
-                        .message_content br + br {
-                            margin-top: 0.5em;
-                        }
-                    `;
-                    
-                    // 创建预览内容
-                    const previewContent = document.createElement('div');
-                    previewContent.appendChild(style);
-                    
-                    const headerDiv = document.createElement('h3');
-                    headerDiv.textContent = `${backup.entityName} - ${backup.chatName} 预览`;
-                    previewContent.appendChild(headerDiv);
-                    
-                    const contentDiv = document.createElement('div');
-                    
-                    // 为每条消息创建单独的盒子
-                    lastMessages.forEach(msg => {
-                        const messageBox = document.createElement('div');
-                        messageBox.className = 'message_box';
+                        // 添加消息
+                        lastMessages.forEach((msg, index) => {
+                            const messageDiv = document.createElement('div');
+                            messageDiv.className = `message_box ${index % 2 === 0 ? 'user_message' : 'assistant_message'}`;
+                            // 检查消息格式并访问正确的属性
+                            messageDiv.innerHTML = processMessage(msg.mes || msg);
+                            previewContainer.appendChild(messageDiv);
+                        });
                         
-                        const senderDiv = document.createElement('div');
-                        senderDiv.className = 'message_sender';
-                        senderDiv.textContent = msg.name || '未知';
-                        
-                        const contentDiv = document.createElement('div');
-                        contentDiv.className = 'message_content';
-                        contentDiv.innerHTML = processMessage(msg.mes);
-                        
-                        messageBox.appendChild(senderDiv);
-                        messageBox.appendChild(contentDiv);
-                        
-                        previewContent.appendChild(messageBox);
-                    });
-                    
-                    const footerDiv = document.createElement('div');
-                    footerDiv.style.marginTop = '10px';
-                    footerDiv.style.opacity = '0.7';
-                    footerDiv.style.fontSize = '0.9em';
-                    footerDiv.textContent = `显示最后 ${lastMessages.length} 条消息，共 ${chat.length} 条`;
-                    previewContent.appendChild(footerDiv);
-                    
-                    // 导入对话框系统
-                    const { callGenericPopup, POPUP_TYPE } = await import('../../../popup.js');
-                    
-                    // 使用系统弹窗显示预览内容
-                    await callGenericPopup(previewContent, POPUP_TYPE.DISPLAY, '', {
-                        wide: true,
-                        allowVerticalScrolling: true,
-                        leftAlign: true,
-                        okButton: '关闭'
-                    });
-                    
+                        // 显示预览
+                        const previewModal = document.createElement('div');
+                        previewModal.className = 'preview_modal';
+                        previewModal.appendChild(previewContainer);
+                        document.body.appendChild(previewModal);
+                    }
                 } else {
-                    console.error('[聊天自动备份] 找不到指定的备份或备份为空:', { timestamp, chatKey });
-                    toastr.error('找不到指定的备份或备份为空');
+                    alert('无法加载预览内容或备份格式不正确');
                 }
             } catch (error) {
-                console.error('[聊天自动备份] 预览过程中出错:', error);
-                toastr.error(`预览过程中出错: ${error.message}`);
+                console.error('预览备份时出错:', error);
+                alert('预览备份时出错: ' + error.message);
             } finally {
-                button.prop('disabled', false).text('预览'); // 恢复按钮状态
+                button.prop('disabled', false).text('预览');
             }
         });
 
@@ -1536,15 +1415,19 @@ jQuery(async () => {
     const performInitialBackupCheck = async () => {
         console.log('[聊天自动备份] 执行初始备份检查');
         try {
-            const context = getContext();
+            logDebug('尝试在初始备份检查前执行 saveChatConditional()');
+            await saveChatConditional(); // <--- 新增：确保聊天数据已保存
+            logDebug('初始备份检查前的 saveChatConditional() 执行完毕');
+
+            const context = getContext(); // 现在 getContext() 会获取到更可靠的数据
             if (context.chat && context.chat.length > 0 && !isBackupInProgress) {
                 logDebug('[聊天自动备份] 发现现有聊天记录，执行初始备份');
-                await performBackupConditional(); // 使用条件函数
+                await performBackupConditional(); // 使用条件函数 (内部也会再次调用saveChatConditional，但通常是无害的)
             } else {
                 logDebug('[聊天自动备份] 当前没有聊天记录或备份进行中，跳过初始备份');
             }
         } catch (error) {
-            console.error('[聊天自动备份] 初始备份执行失败:', error);
+            console.error('[聊天自动备份] 初始备份执行失败 (可能源于 saveChatConditional 或后续逻辑):', error);
         }
     };
 
