@@ -82,22 +82,12 @@ let backupTimeout = null;       // 防抖定时器 ID
 
 // --- 深拷贝逻辑 (将在Worker和主线程中使用) ---
 const deepCopyLogicString = `
-    // Worker message handler - 优化版本，分离metadata和messages处理
     self.onmessage = function(e) {
         const { id, payload } = e.data;
-        if (!payload) {
-             self.postMessage({ id, error: 'Invalid payload received by worker' });
-             return;
-        }
         try {
-            // payload中的metadata和messages已经是通过postMessage的结构化克隆获得的副本
-            // 只需要构建最终备份数组结构，无需额外深拷贝
-            const finalChatFileContent = [payload.metadata, ...payload.messages];
-            
-            // 发送构建好的数组结构
-            self.postMessage({ id, result: finalChatFileContent });
+            // 直接返回，无需再组合
+            self.postMessage({ id, result: payload });
         } catch (error) {
-            console.error('[Worker] Error during data processing for ID:', id, error);
             self.postMessage({ id, error: error.message || 'Worker processing failed' });
         }
     };
@@ -388,7 +378,7 @@ function getCurrentChatInfo() {
 
 // --- Web Worker 通信 ---
 // 发送数据到 Worker 并返回包含拷贝后数据的 Promise
-function performDeepCopyInWorker(metadata, messages) {
+function performDeepCopyInWorker(metadataRef, messagesRef) {
     return new Promise((resolve, reject) => {
         if (!backupWorker) {
             return reject(new Error("Backup worker not initialized."));
@@ -397,20 +387,18 @@ function performDeepCopyInWorker(metadata, messages) {
         const currentRequestId = ++workerRequestId;
         workerPromises[currentRequestId] = { resolve, reject };
 
-        logDebug(`[主线程] 发送数据到 Worker (ID: ${currentRequestId}), Metadata size: ${JSON.stringify(metadata).length}, Messages count: ${messages.length}`);
         try {
-            // 分离发送元数据和消息，利用postMessage的隐式克隆
+            // 在主线程先组合
+            const combinedData = [metadataRef, ...messagesRef];
+            
+            // 然后只传一个组合好的对象
             backupWorker.postMessage({
                 id: currentRequestId,
-                payload: {
-                    metadata: metadata,
-                    messages: messages
-                }
+                payload: combinedData
             });
         } catch (error) {
-             console.error(`[主线程] 发送消息到 Worker 失败 (ID: ${currentRequestId}):`, error);
-             delete workerPromises[currentRequestId];
-             reject(error);
+            delete workerPromises[currentRequestId];
+            reject(error);
         }
     });
 }
@@ -565,16 +553,6 @@ async function executeBackupLogic_Core(settings) {
 
 // --- Conditional backup function ---
 async function performBackupConditional() {
-    // 首先尝试保存当前聊天状态，确保获取的数据是最新的
-    try {
-        logDebug('尝试在备份前执行 saveChatConditional()');
-        await saveChatConditional(); // <--- 新增：确保聊天数据已保存
-        logDebug('saveChatConditional() 执行完毕');
-    } catch (error) {
-        console.error('[聊天自动备份] saveChatConditional 执行失败:', error);
-        // 继续备份过程，但记录错误
-    }
-
     if (isBackupInProgress) {
         logDebug('Backup is already in progress, skipping this request');
         return;
@@ -591,7 +569,7 @@ async function performBackupConditional() {
     clearTimeout(backupTimeout); // Cancel any pending debounced backups
     backupTimeout = null;
 
-    const context = getContext(); // 现在 getContext() 会获取到更可靠的数据
+    const context = getContext();
     const chatKey = getCurrentChatKey();
 
     if (!chatKey) {
@@ -620,7 +598,7 @@ async function performBackupConditional() {
     isBackupInProgress = true;
     logDebug('Setting backup lock');
     try {
-        // executeBackupLogic_Core 内部的 getContext() 也会受益于之前的 saveChatConditional()
+        // 修改：直接调用，让 executeBackupLogic_Core 内部获取数据
         const success = await executeBackupLogic_Core(currentSettings);
         if (success) {
             await updateBackupsList();
@@ -1415,19 +1393,15 @@ jQuery(async () => {
     const performInitialBackupCheck = async () => {
         console.log('[聊天自动备份] 执行初始备份检查');
         try {
-            logDebug('尝试在初始备份检查前执行 saveChatConditional()');
-            await saveChatConditional(); // <--- 新增：确保聊天数据已保存
-            logDebug('初始备份检查前的 saveChatConditional() 执行完毕');
-
-            const context = getContext(); // 现在 getContext() 会获取到更可靠的数据
+            const context = getContext();
             if (context.chat && context.chat.length > 0 && !isBackupInProgress) {
                 logDebug('[聊天自动备份] 发现现有聊天记录，执行初始备份');
-                await performBackupConditional(); // 使用条件函数 (内部也会再次调用saveChatConditional，但通常是无害的)
+                await performBackupConditional(); // 使用条件函数
             } else {
                 logDebug('[聊天自动备份] 当前没有聊天记录或备份进行中，跳过初始备份');
             }
         } catch (error) {
-            console.error('[聊天自动备份] 初始备份执行失败 (可能源于 saveChatConditional 或后续逻辑):', error);
+            console.error('[聊天自动备份] 初始备份执行失败:', error);
         }
     };
 
